@@ -93,14 +93,32 @@ let accessibilityTreeMaxNodeCount = AccessibilityTreeLimits.defaultMaxNodeCount
 let accessibilityTreeMaxDepth = AccessibilityTreeLimits.defaultMaxDepth
 let screenshotCaptureTimeout: TimeInterval = 5
 let screenshotResultMaxPNGBytes = 900_000
-let screenshotResultMaxDimension: CGFloat = 1280
+public let screenshotResultMaxDimension: CGFloat = 1280
 let screenshotResultMinScale: CGFloat = 0.25
+public let screenshotMaxDimensionMinimum = 320
+public let screenshotMaxDimensionMaximum = 4096
 private let windowVisibilityRecoveryDelay: TimeInterval = 0.7
 private let axWebAreaRole = "AXWebArea"
 private let axContentsAttribute = "AXContents"
 private let axVisibleChildrenAttribute = "AXVisibleChildren"
 private let compactGenericActionTargetMaxWidth: CGFloat = 240
 private let compactGenericActionTargetMaxHeight: CGFloat = 120
+
+/// Crop rectangle for a window screenshot, expressed in per-window screenshot
+/// pixels (origin at the top-left of the captured window image).
+public struct CaptureRegion: Equatable {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+
+    public init(x: Int, y: Int, width: Int, height: Int) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
 
 public struct AppSnapshot {
     public let app: RunningAppDescriptor
@@ -152,7 +170,9 @@ enum SnapshotBuilder {
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
-        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation
+        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
+        screenshotRegion: CaptureRegion? = nil
     ) throws -> AppSnapshot {
         if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
             return buildFixtureSnapshot(app: app, state: fixtureState)
@@ -198,7 +218,7 @@ enum SnapshotBuilder {
             throw ComputerUseError.stateUnavailable(computerUseNoWindowFoundMessage)
         }
 
-        return buildAccessibilitySnapshot(
+        return try buildAccessibilitySnapshot(
             app: app,
             appElement: appElement,
             rootElement: rootWindow,
@@ -207,7 +227,9 @@ enum SnapshotBuilder {
             focusedApplication: focusedApplication,
             systemWide: systemWide,
             textLimit: textLimit,
-            treeLimits: treeLimits
+            treeLimits: treeLimits,
+            screenshotMaxDimension: screenshotMaxDimension,
+            screenshotRegion: screenshotRegion
         )
     }
 
@@ -220,10 +242,15 @@ enum SnapshotBuilder {
         focusedApplication: AXUIElement?,
         systemWide: AXUIElement,
         textLimit: SnapshotTextLimit,
-        treeLimits: AccessibilityTreeLimits
-    ) -> AppSnapshot {
+        treeLimits: AccessibilityTreeLimits,
+        screenshotMaxDimension: CGFloat,
+        screenshotRegion: CaptureRegion?
+    ) throws -> AppSnapshot {
         let windowBounds = windowCapture.bounds
-        let screenshotPNGData = windowCapture.pngDataIfAvailable()
+        let screenshotPNGData = try windowCapture.pngDataIfAvailable(
+            maxDimension: screenshotMaxDimension,
+            region: screenshotRegion
+        )
         let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
         let context = RenderContext(
@@ -493,13 +520,53 @@ private struct WindowCapture {
             ?? 1
     }
 
-    func pngDataIfAvailable() -> Data? {
+    func pngDataIfAvailable(maxDimension: CGFloat = screenshotResultMaxDimension, region: CaptureRegion? = nil) throws -> Data? {
         guard let image else {
+            guard region == nil else {
+                throw ComputerUseError.invalidArguments(
+                    "region was requested but no window screenshot is available to crop"
+                )
+            }
             return nil
         }
 
-        return boundedScreenshotPNGData(for: image)
+        let cropped = try croppedScreenshotImage(image, region: region)
+
+        return boundedScreenshotPNGData(for: cropped, maxDimension: maxDimension)
     }
+}
+
+/// Crops `image` to `region` (per-window screenshot pixels). Returns the original
+/// image when `region` is nil. A region that does not fit entirely inside the
+/// captured window image is rejected with `invalidArguments` rather than silently
+/// clamped, so callers never misread a shifted crop as the requested rectangle.
+func croppedScreenshotImage(_ image: CGImage, region: CaptureRegion?) throws -> CGImage {
+    guard let region else {
+        return image
+    }
+
+    let fits = region.x >= 0
+        && region.y >= 0
+        && region.width > 0
+        && region.height > 0
+        && region.x + region.width <= image.width
+        && region.y + region.height <= image.height
+
+    guard fits else {
+        throw ComputerUseError.invalidArguments(
+            "region {x:\(region.x), y:\(region.y), width:\(region.width), height:\(region.height)} "
+                + "is outside the captured window image of \(image.width)x\(image.height) pixels"
+        )
+    }
+
+    let rect = CGRect(x: region.x, y: region.y, width: region.width, height: region.height)
+    guard let cropped = image.cropping(to: rect) else {
+        throw ComputerUseError.invalidArguments(
+            "region could not be cropped from the captured window image"
+        )
+    }
+
+    return cropped
 }
 
 struct WindowCaptureCandidate {

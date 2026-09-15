@@ -54,7 +54,10 @@ public final class ComputerUseToolDispatcher {
                 treeLimits: AccessibilityTreeLimits.defaults.replacing(
                     maxNodeCount: try optionalPositiveInt("max_tree_nodes", in: arguments),
                     maxDepth: try optionalPositiveInt("max_tree_depth", in: arguments)
-                )
+                ),
+                screenshotMaxDimension: try optionalScreenshotMaxDimension(in: arguments)
+                    ?? screenshotResultMaxDimension,
+                screenshotRegion: try optionalCaptureRegion(in: arguments)
             )
         case "click":
             return try service.click(
@@ -184,6 +187,92 @@ public final class ComputerUseToolDispatcher {
         }
 
         return nil
+    }
+
+    private func optionalScreenshotMaxDimension(in arguments: [String: Any]) throws -> CGFloat? {
+        guard let value = arguments["maxDimension"] else {
+            return nil
+        }
+
+        let resolved = try positiveInt(
+            from: value,
+            key: "maxDimension",
+            expectedDescription: "an integer between \(screenshotMaxDimensionMinimum) and \(screenshotMaxDimensionMaximum)"
+        )
+
+        guard resolved >= screenshotMaxDimensionMinimum, resolved <= screenshotMaxDimensionMaximum else {
+            throw ComputerUseError.invalidArguments(
+                "maxDimension must be between \(screenshotMaxDimensionMinimum) and \(screenshotMaxDimensionMaximum)"
+            )
+        }
+
+        return CGFloat(resolved)
+    }
+
+    private func optionalCaptureRegion(in arguments: [String: Any]) throws -> CaptureRegion? {
+        guard let value = arguments["region"] else {
+            return nil
+        }
+
+        guard let object = value as? [String: Any] else {
+            throw ComputerUseError.invalidArguments("region must be an object with x, y, width, and height")
+        }
+
+        let allowedKeys: Set<String> = ["x", "y", "width", "height"]
+        let unknownKeys = Set(object.keys).subtracting(allowedKeys)
+        guard unknownKeys.isEmpty else {
+            throw ComputerUseError.invalidArguments(
+                "region has unknown field(s): \(unknownKeys.sorted().joined(separator: ", "))"
+            )
+        }
+
+        let x = try requiredRegionComponent("x", in: object)
+        let y = try requiredRegionComponent("y", in: object)
+        let width = try requiredRegionComponent("width", in: object)
+        let height = try requiredRegionComponent("height", in: object)
+
+        guard x >= 0, y >= 0 else {
+            throw ComputerUseError.invalidArguments("region x and y must be >= 0")
+        }
+
+        guard width > 0, height > 0 else {
+            throw ComputerUseError.invalidArguments("region width and height must be > 0")
+        }
+
+        return CaptureRegion(x: x, y: y, width: width, height: height)
+    }
+
+    private func requiredRegionComponent(_ key: String, in object: [String: Any]) throws -> Int {
+        guard let value = object[key] else {
+            throw ComputerUseError.invalidArguments("region is missing required field '\(key)'")
+        }
+
+        if let integer = value as? Int {
+            return integer
+        }
+
+        if let double = value as? Double {
+            return try regionComponentInt(double, key: key)
+        }
+
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+                throw ComputerUseError.invalidArguments("region \(key) must be an integer")
+            }
+            return try regionComponentInt(number.doubleValue, key: key)
+        }
+
+        throw ComputerUseError.invalidArguments("region \(key) must be an integer")
+    }
+
+    private func regionComponentInt(_ value: Double, key: String) throws -> Int {
+        guard value.isFinite, value.rounded(.towardZero) == value,
+              value >= Double(Int.min), value <= Double(Int.max)
+        else {
+            throw ComputerUseError.invalidArguments("region \(key) must be an integer")
+        }
+
+        return Int(value)
     }
 
     private func optionalPositiveInt(_ key: String, in arguments: [String: Any]) throws -> Int? {

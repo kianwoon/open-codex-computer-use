@@ -462,9 +462,20 @@ public final class ComputerUseService {
     public func getAppState(
         app query: String,
         textLimit: SnapshotTextLimit = .defaults,
-        treeLimits: AccessibilityTreeLimits = .defaults
+        treeLimits: AccessibilityTreeLimits = .defaults,
+        screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
+        screenshotRegion: CaptureRegion? = nil
     ) throws -> ToolCallResult {
-        snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits), style: .fullState)
+        snapshotResult(
+            for: try refreshSnapshot(
+                for: query,
+                textLimit: textLimit,
+                treeLimits: treeLimits,
+                screenshotMaxDimension: screenshotMaxDimension,
+                screenshotRegion: screenshotRegion
+            ),
+            style: .fullState
+        )
     }
 
     public func click(
@@ -838,14 +849,18 @@ public final class ComputerUseService {
         for query: String,
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
-        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation
+        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
+        screenshotRegion: CaptureRegion? = nil
     ) throws -> AppSnapshot {
         let app = try AppDiscovery.resolve(query)
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
             treeLimits: treeLimits,
-            recoveryPolicy: recoveryPolicy
+            recoveryPolicy: recoveryPolicy,
+            screenshotMaxDimension: screenshotMaxDimension,
+            screenshotRegion: screenshotRegion
         )
 
         let keys = Set([

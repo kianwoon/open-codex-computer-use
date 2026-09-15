@@ -252,6 +252,86 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(size.height, 24)
     }
 
+    func testCroppedScreenshotImageReturnsOriginalWhenRegionIsNil() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+        let cropped = try croppedScreenshotImage(image, region: nil)
+
+        XCTAssertEqual(cropped.width, 40)
+        XCTAssertEqual(cropped.height, 30)
+    }
+
+    func testCroppedScreenshotImageCropsToRequestedRegion() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+        let cropped = try croppedScreenshotImage(
+            image,
+            region: CaptureRegion(x: 10, y: 5, width: 20, height: 15)
+        )
+
+        XCTAssertEqual(cropped.width, 20)
+        XCTAssertEqual(cropped.height, 15)
+    }
+
+    func testCroppedScreenshotImageRejectsOutOfBoundsRegion() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+
+        XCTAssertThrowsError(
+            try croppedScreenshotImage(
+                image,
+                region: CaptureRegion(x: 30, y: 0, width: 20, height: 10)
+            )
+        ) { error in
+            guard case ComputerUseError.invalidArguments = error else {
+                return XCTFail("expected invalidArguments, got \(error)")
+            }
+        }
+    }
+
+    func testGetAppStateRejectsOutOfRangeMaxDimension() {
+        let dispatcher = ComputerUseToolDispatcher()
+        let tooSmall = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "maxDimension": 100]
+        )
+        let tooLarge = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "maxDimension": 8192]
+        )
+
+        XCTAssertTrue(tooSmall.isError)
+        XCTAssertTrue((tooSmall.primaryText ?? "").contains("maxDimension must be between 320 and 4096"))
+        XCTAssertTrue(tooLarge.isError)
+    }
+
+    func testGetAppStateRejectsMalformedRegion() {
+        let dispatcher = ComputerUseToolDispatcher()
+
+        let negative = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": -1, "y": 0, "width": 10, "height": 10]]
+        )
+        let zeroSize = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 0, "height": 10]]
+        )
+        let unknownField = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 10, "height": 10, "z": 1]]
+        )
+        let missingField = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 10]]
+        )
+
+        XCTAssertTrue(negative.isError)
+        XCTAssertTrue((negative.primaryText ?? "").contains("region x and y must be >= 0"))
+        XCTAssertTrue(zeroSize.isError)
+        XCTAssertTrue((zeroSize.primaryText ?? "").contains("region width and height must be > 0"))
+        XCTAssertTrue(unknownField.isError)
+        XCTAssertTrue((unknownField.primaryText ?? "").contains("unknown field"))
+        XCTAssertTrue(missingField.isError)
+        XCTAssertTrue((missingField.primaryText ?? "").contains("missing required field 'height'"))
+    }
+
     func testToolDefinitionCount() {
         XCTAssertEqual(ToolDefinitions.all.count, 9)
     }
@@ -684,6 +764,15 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(getAppStateProperties?["max_tree_nodes"]?["minimum"] as? Int, 1)
         XCTAssertEqual(getAppStateProperties?["max_tree_depth"]?["type"] as? String, "integer")
         XCTAssertEqual(getAppStateProperties?["max_tree_depth"]?["minimum"] as? Int, 1)
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["type"] as? String, "integer")
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["minimum"] as? Int, 320)
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["maximum"] as? Int, 4096)
+        XCTAssertEqual(getAppStateProperties?["region"]?["type"] as? String, "object")
+        XCTAssertEqual(getAppStateProperties?["region"]?["additionalProperties"] as? Bool, false)
+        XCTAssertEqual(
+            getAppStateProperties?["region"]?["required"] as? [String],
+            ["x", "y", "width", "height"]
+        )
         XCTAssertEqual(getAppStateSchema?["required"] as? [String], ["app"])
         let scrollPages = (tools["scroll"]?.inputSchema["properties"] as? [String: [String: Any]])?["pages"]
         XCTAssertEqual(scrollPages?["type"] as? String, "number")

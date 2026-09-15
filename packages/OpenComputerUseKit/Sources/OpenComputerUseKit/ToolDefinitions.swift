@@ -78,6 +78,8 @@ public enum ToolDefinitions {
                     "text_limit": textLimitProperty(description: "Maximum text characters to return. Use \"max\" for full text. Defaults to 500."),
                     "max_tree_nodes": positiveIntegerProperty(description: "Maximum accessibility tree nodes to render. Defaults to 1200."),
                     "max_tree_depth": positiveIntegerProperty(description: "Maximum accessibility tree depth to render. Defaults to 64."),
+                    "maxDimension": boundedIntegerProperty(description: "Longest edge of the returned window screenshot in pixels. Lower values shrink the image. Defaults to 1280.", minimum: 320, maximum: 4096),
+                    "region": captureRegionProperty(description: "Crop the window screenshot to this rectangle, in per-window screenshot pixels. Returned coordinates stay per-window screenshot pixels, so a click at local (lx, ly) maps to window pixel (region.x + lx, region.y + ly). Omit to capture the whole window."),
                 ],
                 required: ["app"]
             )
@@ -210,6 +212,30 @@ private func positiveIntegerProperty(description: String) -> [String: Any] {
         "type": "integer",
         "minimum": 1,
         "description": description,
+    ]
+}
+
+private func boundedIntegerProperty(description: String, minimum: Int, maximum: Int) -> [String: Any] {
+    [
+        "type": "integer",
+        "minimum": minimum,
+        "maximum": maximum,
+        "description": description,
+    ]
+}
+
+private func captureRegionProperty(description: String) -> [String: Any] {
+    [
+        "type": "object",
+        "description": description,
+        "properties": [
+            "x": integerProperty(description: "Region origin X in per-window screenshot pixels. Must be >= 0."),
+            "y": integerProperty(description: "Region origin Y in per-window screenshot pixels. Must be >= 0."),
+            "width": integerProperty(description: "Region width in per-window screenshot pixels. Must be > 0."),
+            "height": integerProperty(description: "Region height in per-window screenshot pixels. Must be > 0."),
+        ],
+        "required": ["x", "y", "width", "height"],
+        "additionalProperties": false,
     ]
 }
 
