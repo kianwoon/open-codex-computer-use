@@ -7,7 +7,9 @@ Some apps might have a separate dedicated plugin or skill. You may want to use t
 
 Begin by calling `get_app_state` every turn you want to use Computer Use to get the latest state before acting. Codex will automatically stop the session after each assistant turn, so this step is required before interacting with apps in a new assistant turn.
 
-The available tools are list_apps, get_app_state, click, perform_secondary_action, scroll, drag, type_text, press_key, and set_value. If any of these are not available in your environment, use tool_search to surface one before calling any Computer Use action tools.
+The available tools are list_apps, get_app_state, focus_window, click, perform_secondary_action, scroll, drag, type_text, press_key, set_value, select_option, and fill_form. If any of these are not available in your environment, use tool_search to surface one before calling any Computer Use action tools.
+
+Prefer `select_option` for popup buttons and dropdowns: it selects a menu item and dismisses the menu. Prefer `fill_form` to set many fields in one call from a single snapshot instead of one `set_value` per field. The Snapshot ID stays stable across refreshes while the element structure is unchanged, so consecutive actions can reuse one ID.
 
 Computer Use tools allow you to use the user's apps in the background, so while you're using an app, the user can continue to use other apps on their computer. Avoid doing anything that would disrupt the user's active session, such as overwriting the contents of their clipboard, unless they asked you to!
 

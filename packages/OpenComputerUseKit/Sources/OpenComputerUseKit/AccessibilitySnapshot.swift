@@ -93,8 +93,10 @@ let accessibilityTreeMaxNodeCount = AccessibilityTreeLimits.defaultMaxNodeCount
 let accessibilityTreeMaxDepth = AccessibilityTreeLimits.defaultMaxDepth
 let screenshotCaptureTimeout: TimeInterval = 5
 let screenshotResultMaxPNGBytes = 900_000
-let screenshotResultMaxDimension: CGFloat = 1280
+public let screenshotResultMaxDimension: CGFloat = 1280
 let screenshotResultMinScale: CGFloat = 0.25
+public let screenshotMaxDimensionMinimum = 320
+public let screenshotMaxDimensionMaximum = 4096
 private let windowVisibilityRecoveryDelay: TimeInterval = 0.7
 private let axWebAreaRole = "AXWebArea"
 private let axContentsAttribute = "AXContents"
@@ -102,8 +104,25 @@ private let axVisibleChildrenAttribute = "AXVisibleChildren"
 private let compactGenericActionTargetMaxWidth: CGFloat = 240
 private let compactGenericActionTargetMaxHeight: CGFloat = 120
 
+/// Crop rectangle for a window screenshot, expressed in per-window screenshot
+/// pixels (origin at the top-left of the captured window image).
+public struct CaptureRegion: Equatable {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+
+    public init(x: Int, y: Int, width: Int, height: Int) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
 public struct AppSnapshot {
     public let app: RunningAppDescriptor
+    public let snapshotID: String
     public let windowTitle: String?
     public let windowBounds: CGRect?
     let targetWindowID: CGWindowID?
@@ -138,21 +157,77 @@ public struct AppSnapshot {
             lines.append("The focused UI element is \(focusedSummary).")
         }
 
+        if style == .fullState {
+            lines.append("")
+            lines.append("Snapshot ID: \(snapshotID)")
+        }
+
         return lines.joined(separator: "\n")
     }
 }
 
-public enum SnapshotTextStyle {
+public enum SnapshotTextStyle: Equatable {
     case fullState
     case actionResult
 }
 
+extension AppSnapshot {
+    /// Stable identity of the rendered element structure: element count plus the
+    /// ordered role/identifier sequence. When this is unchanged across a refresh
+    /// the snapshot id is preserved so callers can reuse one id across consecutive
+    /// actions instead of forcing a get_app_state per field.
+    var structureSignature: String {
+        elements.keys.sorted().map { index -> String in
+            let record = elements[index]
+            return "\(index):\(record?.role ?? ""):\(record?.identifier ?? "")"
+        }.joined(separator: "|")
+    }
+
+    /// Reuses `prior`'s snapshot id when the element structure is unchanged, so
+    /// consecutive actions can share one id. A structure change yields `self`.
+    func preservingSnapshotID(from prior: AppSnapshot?) -> AppSnapshot {
+        guard let prior, prior.mode == mode, prior.structureSignature == structureSignature else {
+            return self
+        }
+
+        return withSnapshotID(prior.snapshotID)
+    }
+
+    func withSnapshotID(_ snapshotID: String) -> AppSnapshot {        AppSnapshot(
+            app: app,
+            snapshotID: snapshotID,
+            windowTitle: windowTitle,
+            windowBounds: windowBounds,
+            targetWindowID: targetWindowID,
+            targetWindowLayer: targetWindowLayer,
+            screenshotPNGData: screenshotPNGData,
+            mode: mode,
+            treeLines: treeLines,
+            focusedSummary: focusedSummary,
+            focusedElement: focusedElement,
+            selectedText: selectedText,
+            elements: elements
+        )
+    }
+}
+
 enum SnapshotBuilder {
+    static func currentWindow(appElement: AXUIElement, appPID: pid_t, focusedApplication: AXUIElement?) -> AXUIElement? {
+        preferredFocusedWindow(
+            appElement: appElement,
+            appPID: appPID,
+            focusedApplication: focusedApplication,
+            systemWide: AXUIElementCreateSystemWide()
+        )
+    }
+
     static func build(
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
-        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation
+        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
+        screenshotRegion: CaptureRegion? = nil
     ) throws -> AppSnapshot {
         if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
             return buildFixtureSnapshot(app: app, state: fixtureState)
@@ -198,7 +273,7 @@ enum SnapshotBuilder {
             throw ComputerUseError.stateUnavailable(computerUseNoWindowFoundMessage)
         }
 
-        return buildAccessibilitySnapshot(
+        return try buildAccessibilitySnapshot(
             app: app,
             appElement: appElement,
             rootElement: rootWindow,
@@ -207,7 +282,9 @@ enum SnapshotBuilder {
             focusedApplication: focusedApplication,
             systemWide: systemWide,
             textLimit: textLimit,
-            treeLimits: treeLimits
+            treeLimits: treeLimits,
+            screenshotMaxDimension: screenshotMaxDimension,
+            screenshotRegion: screenshotRegion
         )
     }
 
@@ -220,10 +297,15 @@ enum SnapshotBuilder {
         focusedApplication: AXUIElement?,
         systemWide: AXUIElement,
         textLimit: SnapshotTextLimit,
-        treeLimits: AccessibilityTreeLimits
-    ) -> AppSnapshot {
+        treeLimits: AccessibilityTreeLimits,
+        screenshotMaxDimension: CGFloat,
+        screenshotRegion: CaptureRegion?
+    ) throws -> AppSnapshot {
         let windowBounds = windowCapture.bounds
-        let screenshotPNGData = windowCapture.pngDataIfAvailable()
+        let screenshotPNGData = try windowCapture.pngDataIfAvailable(
+            maxDimension: screenshotMaxDimension,
+            region: screenshotRegion
+        )
         let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
         let context = RenderContext(
@@ -243,6 +325,7 @@ enum SnapshotBuilder {
 
         return AppSnapshot(
             app: app,
+            snapshotID: UUID().uuidString,
             windowTitle: windowTitle,
             windowBounds: windowBounds,
             targetWindowID: windowCapture.windowID,
@@ -260,16 +343,20 @@ enum SnapshotBuilder {
     private static func recoverVisibleWindow(for app: RunningAppDescriptor, appElement: AXUIElement, preferredWindow: AXUIElement?) -> Bool {
         var recovered = false
 
-        if let runningApplication = NSRunningApplication(processIdentifier: app.pid) {
-            recovered = runningApplication.unhide() || recovered
-            recovered = runningApplication.activate(options: [.activateAllWindows]) || recovered
+        if preferredWindow == nil {
+            // Only broad app-level activation is allowed when we do not yet know
+            // which window to target; raising app-wide can bring up a different window.
+            if let runningApplication = NSRunningApplication(processIdentifier: app.pid) {
+                recovered = runningApplication.unhide() || recovered
+                recovered = runningApplication.activate(options: [.activateAllWindows]) || recovered
+            }
+
+            if let bundleIdentifier = app.bundleIdentifier {
+                recovered = openBundleIdentifier(bundleIdentifier) || recovered
+            }
         }
 
-        if let bundleIdentifier = app.bundleIdentifier {
-            recovered = openBundleIdentifier(bundleIdentifier) || recovered
-        }
-
-        if let window = preferredWindow ?? firstAnyWindow(for: appElement) {
+        if let window = preferredWindow ?? mainWindow(for: appElement) {
             recovered = unminimize(window) || recovered
             recovered = raise(window) || recovered
             recovered = setBoolAttribute(named: kAXMainAttribute as String, on: window) || recovered
@@ -300,6 +387,10 @@ enum SnapshotBuilder {
     }
 
     private static func firstWindow(for appElement: AXUIElement) -> AXUIElement? {
+        if let mainWindow = mainWindow(for: appElement) {
+            return mainWindow
+        }
+
         guard let windows = copyArray(appElement, attribute: kAXWindowsAttribute) else {
             return nil
         }
@@ -307,9 +398,8 @@ enum SnapshotBuilder {
         return windows.first(where: isUsableWindowElement(_:))
     }
 
-    private static func firstAnyWindow(for appElement: AXUIElement) -> AXUIElement? {
-        copyElement(appElement, attribute: kAXFocusedWindowAttribute)
-            ?? copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: { stringValue(of: $0, attribute: kAXRoleAttribute) == kAXWindowRole as String })
+    private static func mainWindow(for appElement: AXUIElement) -> AXUIElement? {
+        usableWindowElement(from: copyElement(appElement, attribute: kAXMainWindowAttribute))
     }
 
     private static func unminimize(_ window: AXUIElement) -> Bool {
@@ -399,6 +489,7 @@ enum SnapshotBuilder {
 
         return AppSnapshot(
             app: app,
+            snapshotID: UUID().uuidString,
             windowTitle: state.windowTitle,
             windowBounds: state.windowBounds.cgRect,
             targetWindowID: nil,
@@ -414,7 +505,7 @@ enum SnapshotBuilder {
     }
 }
 
-private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
+func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
     // Chromium/Electron apps may withhold parts of their AX tree until manual
     // accessibility is enabled. These private attributes are best-effort and
     // harmlessly fail on apps that do not support them.
@@ -493,13 +584,53 @@ private struct WindowCapture {
             ?? 1
     }
 
-    func pngDataIfAvailable() -> Data? {
+    func pngDataIfAvailable(maxDimension: CGFloat = screenshotResultMaxDimension, region: CaptureRegion? = nil) throws -> Data? {
         guard let image else {
+            guard region == nil else {
+                throw ComputerUseError.invalidArguments(
+                    "region was requested but no window screenshot is available to crop"
+                )
+            }
             return nil
         }
 
-        return boundedScreenshotPNGData(for: image)
+        let cropped = try croppedScreenshotImage(image, region: region)
+
+        return boundedScreenshotPNGData(for: cropped, maxDimension: maxDimension)
     }
+}
+
+/// Crops `image` to `region` (per-window screenshot pixels). Returns the original
+/// image when `region` is nil. A region that does not fit entirely inside the
+/// captured window image is rejected with `invalidArguments` rather than silently
+/// clamped, so callers never misread a shifted crop as the requested rectangle.
+func croppedScreenshotImage(_ image: CGImage, region: CaptureRegion?) throws -> CGImage {
+    guard let region else {
+        return image
+    }
+
+    let fits = region.x >= 0
+        && region.y >= 0
+        && region.width > 0
+        && region.height > 0
+        && region.x + region.width <= image.width
+        && region.y + region.height <= image.height
+
+    guard fits else {
+        throw ComputerUseError.invalidArguments(
+            "region {x:\(region.x), y:\(region.y), width:\(region.width), height:\(region.height)} "
+                + "is outside the captured window image of \(image.width)x\(image.height) pixels"
+        )
+    }
+
+    let rect = CGRect(x: region.x, y: region.y, width: region.width, height: region.height)
+    guard let cropped = image.cropping(to: rect) else {
+        throw ComputerUseError.invalidArguments(
+            "region could not be cropped from the captured window image"
+        )
+    }
+
+    return cropped
 }
 
 struct WindowCaptureCandidate {
@@ -1083,7 +1214,7 @@ private func valueTypeTrait(of element: AXUIElement) -> String? {
     return nil
 }
 
-private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
+func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     guard error == .success, let value else {
@@ -1093,7 +1224,7 @@ private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIEleme
     return (value as! AXUIElement)
 }
 
-private func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
+func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     guard error == .success, let value else {
@@ -1123,7 +1254,7 @@ private func attributeValue(of element: AXUIElement, attribute: String) -> CFTyp
     return value
 }
 
-private func stringValue(of element: AXUIElement, attribute: String) -> String? {
+func stringValue(of element: AXUIElement, attribute: String) -> String? {
     guard let value = attributeValue(of: element, attribute: attribute) else {
         return nil
     }
@@ -1156,10 +1287,19 @@ private func boolValue(of element: AXUIElement, attribute: String) -> Bool? {
     return value as? Bool
 }
 
-private func pid(of element: AXUIElement) -> pid_t {
+func pid(of element: AXUIElement) -> pid_t {
     var processIdentifier: pid_t = 0
     AXUIElementGetPid(element, &processIdentifier)
     return processIdentifier
+}
+
+/// Probes an AX element handle to determine whether it still resolves.
+/// There is no public `AXUIElementIsValid`, so we read the role attribute and
+/// treat an explicit `.invalidUIElement` result as a stale handle.
+func axElementIsValid(_ element: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    let error = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+    return error != .invalidUIElement
 }
 
 private func isSettable(of element: AXUIElement, attribute: String) -> Bool {

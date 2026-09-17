@@ -252,8 +252,88 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(size.height, 24)
     }
 
+    func testCroppedScreenshotImageReturnsOriginalWhenRegionIsNil() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+        let cropped = try croppedScreenshotImage(image, region: nil)
+
+        XCTAssertEqual(cropped.width, 40)
+        XCTAssertEqual(cropped.height, 30)
+    }
+
+    func testCroppedScreenshotImageCropsToRequestedRegion() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+        let cropped = try croppedScreenshotImage(
+            image,
+            region: CaptureRegion(x: 10, y: 5, width: 20, height: 15)
+        )
+
+        XCTAssertEqual(cropped.width, 20)
+        XCTAssertEqual(cropped.height, 15)
+    }
+
+    func testCroppedScreenshotImageRejectsOutOfBoundsRegion() throws {
+        let image = try makeSolidTestImage(width: 40, height: 30)
+
+        XCTAssertThrowsError(
+            try croppedScreenshotImage(
+                image,
+                region: CaptureRegion(x: 30, y: 0, width: 20, height: 10)
+            )
+        ) { error in
+            guard case ComputerUseError.invalidArguments = error else {
+                return XCTFail("expected invalidArguments, got \(error)")
+            }
+        }
+    }
+
+    func testGetAppStateRejectsOutOfRangeMaxDimension() {
+        let dispatcher = ComputerUseToolDispatcher()
+        let tooSmall = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "maxDimension": 100]
+        )
+        let tooLarge = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "maxDimension": 8192]
+        )
+
+        XCTAssertTrue(tooSmall.isError)
+        XCTAssertTrue((tooSmall.primaryText ?? "").contains("maxDimension must be between 320 and 4096"))
+        XCTAssertTrue(tooLarge.isError)
+    }
+
+    func testGetAppStateRejectsMalformedRegion() {
+        let dispatcher = ComputerUseToolDispatcher()
+
+        let negative = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": -1, "y": 0, "width": 10, "height": 10]]
+        )
+        let zeroSize = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 0, "height": 10]]
+        )
+        let unknownField = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 10, "height": 10, "z": 1]]
+        )
+        let missingField = dispatcher.callToolAsResult(
+            name: "get_app_state",
+            arguments: ["app": "Sublime Text", "region": ["x": 0, "y": 0, "width": 10]]
+        )
+
+        XCTAssertTrue(negative.isError)
+        XCTAssertTrue((negative.primaryText ?? "").contains("region x and y must be >= 0"))
+        XCTAssertTrue(zeroSize.isError)
+        XCTAssertTrue((zeroSize.primaryText ?? "").contains("region width and height must be > 0"))
+        XCTAssertTrue(unknownField.isError)
+        XCTAssertTrue((unknownField.primaryText ?? "").contains("unknown field"))
+        XCTAssertTrue(missingField.isError)
+        XCTAssertTrue((missingField.primaryText ?? "").contains("missing required field 'height'"))
+    }
+
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.count, 9)
+        XCTAssertEqual(ToolDefinitions.all.count, 12)
     }
 
     func testReadToolArgumentsAcceptsJSONObject() throws {
@@ -684,6 +764,15 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(getAppStateProperties?["max_tree_nodes"]?["minimum"] as? Int, 1)
         XCTAssertEqual(getAppStateProperties?["max_tree_depth"]?["type"] as? String, "integer")
         XCTAssertEqual(getAppStateProperties?["max_tree_depth"]?["minimum"] as? Int, 1)
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["type"] as? String, "integer")
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["minimum"] as? Int, 320)
+        XCTAssertEqual(getAppStateProperties?["maxDimension"]?["maximum"] as? Int, 4096)
+        XCTAssertEqual(getAppStateProperties?["region"]?["type"] as? String, "object")
+        XCTAssertEqual(getAppStateProperties?["region"]?["additionalProperties"] as? Bool, false)
+        XCTAssertEqual(
+            getAppStateProperties?["region"]?["required"] as? [String],
+            ["x", "y", "width", "height"]
+        )
         XCTAssertEqual(getAppStateSchema?["required"] as? [String], ["app"])
         let scrollPages = (tools["scroll"]?.inputSchema["properties"] as? [String: [String: Any]])?["pages"]
         XCTAssertEqual(scrollPages?["type"] as? String, "number")
@@ -1769,6 +1858,123 @@ final class OpenComputerUseKitTests: XCTestCase {
         )
     }
 
+    func testInvalidUIElementSettableGateSurfacesStaleElementError() {
+        XCTAssertThrowsError(
+            try setValueAttributeIsSettable(result: .invalidUIElement, settable: false, attribute: kAXValueAttribute)
+        ) { error in
+            guard case .staleElement = (error as? ComputerUseError) else {
+                return XCTFail("expected staleElement, got \(error)")
+            }
+            XCTAssertEqual((error as? ComputerUseError)?.errorDescription, staleElementErrorMessage)
+        }
+    }
+
+    func testStaleSnapshotAndElementErrorsCarryExpectedMessages() {
+        XCTAssertEqual(staleSnapshotErrorMessage, "stale snapshot — call get_app_state again")
+        XCTAssertEqual(ComputerUseError.staleSnapshot(staleSnapshotErrorMessage).errorDescription, staleSnapshotErrorMessage)
+        XCTAssertEqual(ComputerUseError.staleElement(staleElementErrorMessage).errorDescription, staleElementErrorMessage)
+    }
+
+    func testAppSnapshotSnapshotIDIsAccessibleAndRendered() {
+        let snapshot = makeSnapshot(treeLines: [], focusedSummary: nil)
+        XCTAssertEqual(snapshot.snapshotID, "00000000-0000-0000-0000-000000000000")
+        XCTAssertTrue(snapshot.renderedText(style: .fullState).contains(snapshot.snapshotID))
+    }
+
+    func testFullStateRenderingIncludesSnapshotIDAndActionResultOmitsIt() {
+        let snapshot = makeSnapshot(treeLines: ["\t0 standard window Sample Chat"], focusedSummary: nil)
+        XCTAssertTrue(snapshot.renderedText(style: .fullState).contains("Snapshot ID: \(snapshot.snapshotID)"))
+        XCTAssertFalse(snapshot.renderedText(style: .actionResult).contains("Snapshot ID:"))
+    }
+
+    func testClickTypeTextAndSetValueRequireSnapshotIDInSchema() throws {
+        let clickSchema = toolsSchema()["click"]
+        let setValueSchema = toolsSchema()["set_value"]
+        let typeTextSchema = toolsSchema()["type_text"]
+
+        XCTAssertEqual((clickSchema?["properties"] as? [String: [String: Any]])?["snapshot_id"]?["type"] as? String, "string")
+        XCTAssertTrue((clickSchema?["required"] as? [String])?.contains("snapshot_id") == true)
+        XCTAssertTrue((setValueSchema?["required"] as? [String])?.contains("snapshot_id") == true)
+        XCTAssertTrue((typeTextSchema?["required"] as? [String])?.contains("snapshot_id") == true)
+    }
+
+    func testFocusWindowToolDefinitionIsPresentAndNeverLaunches() throws {
+        let tools = toolsSchema()
+        let focusWindow = try XCTUnwrap(tools["focus_window"])
+        let properties = focusWindow["properties"] as? [String: [String: Any]]
+        XCTAssertEqual(focusWindow["required"] as? [String], ["app"])
+        XCTAssertEqual(properties?["title_contains"]?["type"] as? String, "string")
+        XCTAssertEqual(properties?["pid"]?["type"] as? String, "integer")
+        let definition = ToolDefinitions.all.first { $0.name == "focus_window" }
+        XCTAssertTrue(definition?.description.contains("Never launches") == true)
+    }
+
+    // FIX 1a: focus_window on a missing app throws appNotFound and never launches.
+    func testFocusWindowMissingAppThrowsWithoutLaunching() {
+        let service = ComputerUseService()
+        XCTAssertThrowsError(
+            try service.focusWindow(app: "ocu-definitely-not-running-\(UUID().uuidString)")
+        ) { error in
+            guard case ComputerUseError.appNotFound = error else {
+                return XCTFail("expected appNotFound, got \(error)")
+            }
+        }
+    }
+
+    // FIX 1b: title_hint mismatch throws staleSnapshot with the expected message.
+    func testWindowTitleHintMismatchThrowsStaleSnapshot() {
+        let snapshot = makeSnapshot(treeLines: [], focusedSummary: nil)
+        XCTAssertThrowsError(try validateWindowTitleHint("Apply", snapshot: snapshot)) { error in
+            guard case ComputerUseError.staleSnapshot(let message) = error else {
+                return XCTFail("expected staleSnapshot, got \(error)")
+            }
+            XCTAssertTrue(message.contains("window mismatch: expected 'Apply', got 'Sample Chat'"))
+            XCTAssertTrue(message.contains("call focus_window first"))
+        }
+
+        XCTAssertNoThrow(try validateWindowTitleHint("sample", snapshot: snapshot))
+        XCTAssertNoThrow(try validateWindowTitleHint(nil, snapshot: snapshot))
+    }
+
+    // FIX 2b: a missing snapshot_id is rejected and no action is performed.
+    func testClickWithNilSnapshotIDThrowsWithoutClicking() {
+        let dispatcher = ComputerUseToolDispatcher()
+        let result = dispatcher.callToolAsResult(
+            name: "click",
+            arguments: ["app": "Sublime Text", "element_index": "0"]
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.primaryText, snapshotIDRequiredErrorMessage)
+    }
+
+    func testValidateSnapshotIDValueRejectsNilAndMismatch() throws {
+        let snapshot = makeSnapshot(treeLines: [], focusedSummary: nil)
+
+        XCTAssertThrowsError(try validateSnapshotIDValue(nil, snapshot: snapshot)) { error in
+            XCTAssertEqual((error as? ComputerUseError)?.errorDescription, snapshotIDRequiredErrorMessage)
+        }
+        XCTAssertThrowsError(try validateSnapshotIDValue("other-id", snapshot: snapshot)) { error in
+            XCTAssertEqual((error as? ComputerUseError)?.errorDescription, staleSnapshotErrorMessage)
+        }
+        XCTAssertNoThrow(try validateSnapshotIDValue(snapshot.snapshotID, snapshot: snapshot))
+    }
+
+    // FIX 2c: a click target owned by a different pid is rejected, no activation.
+    func testClickWithMismatchedPidThrowsWithoutActivation() {
+        let snapshot = makeSnapshot(treeLines: [], focusedSummary: nil)
+        XCTAssertThrowsError(try validateClickOwnership(elementPID: snapshot.app.pid + 1, snapshotPID: snapshot.app.pid)) { error in
+            guard case ComputerUseError.staleSnapshot = error else {
+                return XCTFail("expected staleSnapshot, got \(error)")
+            }
+        }
+        XCTAssertNoThrow(try validateClickOwnership(elementPID: snapshot.app.pid, snapshotPID: snapshot.app.pid))
+    }
+
+    private func toolsSchema() -> [String: [String: Any]] {
+        Dictionary(uniqueKeysWithValues: ToolDefinitions.all.map { ($0.name, $0.inputSchema) })
+    }
+
     func testSetValueAttributeGateMatchesOfficialSettableBoundary() throws {
         XCTAssertTrue(try setValueAttributeIsSettable(result: .success, settable: true, attribute: kAXValueAttribute))
         XCTAssertFalse(try setValueAttributeIsSettable(result: .success, settable: false, attribute: kAXValueAttribute))
@@ -2309,7 +2515,330 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertGreaterThan(abs(negativePose.angleOffset), 0.08)
     }
 
-    private func makeSnapshot(treeLines: [String], focusedSummary: String?, selectedText: String? = nil) -> AppSnapshot {
+    // MARK: - element_key / select_option / fill_form / stale-retry
+
+    func testElementKeyResolvesIdentifierBeforeIndex() throws {
+        let service = ComputerUseService()
+        let snapshot = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            snapshotID: "snap-key",
+            elements: [
+                0: makeElementRecord(index: 0, identifier: "field-a", role: kAXTextFieldRole as String),
+                1: makeElementRecord(index: 1, identifier: "field-b", role: kAXTextFieldRole as String),
+            ]
+        )
+
+        // element_key wins even when a different element_index is supplied.
+        let byKey = try service.lookupElement(snapshot: snapshot, index: "0", elementKey: "field-b")
+        XCTAssertEqual(byKey.identifier, "field-b")
+        XCTAssertEqual(byKey.index, 1)
+
+        // index fallback still works when the key is absent.
+        let byIndex = try service.lookupElement(snapshot: snapshot, index: "0", elementKey: nil)
+        XCTAssertEqual(byIndex.index, 0)
+    }
+
+    func testElementKeyUnknownWithoutIndexThrows() {
+        let service = ComputerUseService()
+        let snapshot = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            elements: [0: makeElementRecord(index: 0, identifier: "field-a", role: kAXTextFieldRole as String)]
+        )
+
+        XCTAssertThrowsError(try service.lookupElement(snapshot: snapshot, index: nil, elementKey: "missing")) { error in
+            guard case ComputerUseError.invalidArguments(let message) = error else {
+                return XCTFail("expected invalidArguments, got \(error)")
+            }
+            XCTAssertEqual(message, "unknown element_key 'missing'")
+        }
+    }
+
+    func testOptionNotFoundMessageListsAvailableTitles() {
+        let withTitles = optionNotFoundMessage(
+            option: "Bogus",
+            elementIndex: "7",
+            availableTitles: ["Small", "Medium", "Large"]
+        )
+        XCTAssertEqual(withTitles, "no menu item matching 'Bogus' for element 7 (available: Small, Medium, Large)")
+
+        let withoutTitles = optionNotFoundMessage(option: "Bogus", elementIndex: "7", availableTitles: [])
+        XCTAssertEqual(withoutTitles, "no menu item matching 'Bogus' for element 7")
+    }
+
+    func testMenuOptionMatchesSubstringCaseInsensitiveAcrossRoles() {
+        let candidates = [
+            MenuOptionCandidate(role: kAXMenuItemRole as String, title: "Bachelor of Arts", value: nil),
+            MenuOptionCandidate(role: kAXRowRole as String, title: "bachelor of science", value: nil),
+            MenuOptionCandidate(role: kAXStaticTextRole as String, title: nil, value: "MASTER"),
+        ]
+
+        XCTAssertTrue(menuOptionCandidateMatches(candidates[0], option: "bachelor"))
+        XCTAssertTrue(menuOptionCandidateMatches(candidates[1], option: "BACHELOR"))
+        XCTAssertEqual(firstMatchingMenuOptionIndex(in: candidates, option: "bachelor"), 0)
+        // Value-only matches count too (native selects sometimes omit the title).
+        XCTAssertTrue(menuOptionCandidateMatches(candidates[2], option: "master"))
+        XCTAssertEqual(firstMatchingMenuOptionIndex(in: candidates, option: "master"), 2)
+        XCTAssertNil(firstMatchingMenuOptionIndex(in: candidates, option: "doctorate"))
+    }
+
+    func testMenuOptionRejectsNonSelectableRolesAndEmptyOption() {
+        let group = MenuOptionCandidate(role: kAXGroupRole as String, title: "Bachelor", value: nil)
+        XCTAssertFalse(menuOptionCandidateMatches(group, option: "bachelor"))
+
+        let blank = MenuOptionCandidate(role: kAXMenuItemRole as String, title: "", value: nil)
+        XCTAssertFalse(menuOptionCandidateMatches(blank, option: ""))
+        XCTAssertFalse(menuOptionCandidateMatches(blank, option: "bachelor"))
+    }
+
+    func testOptionNotFoundMessageListsAvailableTitlesFromCandidates() {
+        let candidates = [
+            MenuOptionCandidate(role: kAXMenuItemRole as String, title: "Bachelor", value: nil),
+            MenuOptionCandidate(role: kAXRowRole as String, title: "Master", value: nil),
+        ]
+        XCTAssertEqual(
+            optionNotFoundMessage(option: "PhD", elementIndex: "55", availableTitles: candidates.compactMap(\.title)),
+            "no menu item matching 'PhD' for element 55 (available: Bachelor, Master)"
+        )
+    }
+
+    func testFocusVerifyAcceptsMainWindowWhenSystemFocusedIsNilAndAppFrontmost() {
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 0,
+                focusedTitle: nil,
+                appPID: 42,
+                expectedTitle: "Inbox",
+                frontmostAppPID: 42,
+                targetMainWindowTitle: "Inbox"
+            ),
+            .focused
+        )
+    }
+
+    func testFocusVerifyRetriesWhileTargetMainWindowTitleMismatches() {
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 0,
+                focusedTitle: nil,
+                appPID: 42,
+                expectedTitle: "Inbox",
+                frontmostAppPID: 42,
+                targetMainWindowTitle: "Spam"
+            ),
+            .retry
+        )
+
+        // No main window exposed yet -> still retry, never silently succeed.
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 0,
+                focusedTitle: nil,
+                appPID: 42,
+                expectedTitle: nil,
+                frontmostAppPID: 42,
+                targetMainWindowTitle: nil
+            ),
+            .failed
+        )
+    }
+
+    func testFocusVerifyFailsWhenDifferentAppFrontmost() {
+        // pid-0 system focus must never be accepted when another app is frontmost.
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 0,
+                focusedTitle: nil,
+                appPID: 42,
+                expectedTitle: nil,
+                frontmostAppPID: 99,
+                targetMainWindowTitle: "Inbox"
+            ),
+            .failed
+        )
+
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 99,
+                focusedTitle: "Other",
+                appPID: 42,
+                expectedTitle: nil,
+                frontmostAppPID: 99,
+                targetMainWindowTitle: nil
+            ),
+            .failed
+        )
+    }
+
+    func testFocusVerifySucceedsWhenFocusedWindowMatchesTargetPID() {
+        XCTAssertEqual(
+            focusVerificationOutcome(
+                focusedPID: 42,
+                focusedTitle: "Inbox",
+                appPID: 42,
+                expectedTitle: "Inbox",
+                frontmostAppPID: 42,
+                targetMainWindowTitle: nil
+            ),
+            .focused
+        )
+    }
+
+    func testFillFormParsesItemsAndWritesFixtureBatch() {
+        let service = ComputerUseService()
+        let snapshot = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            mode: .fixture,
+            elements: [
+                0: makeElementRecord(index: 0, identifier: "field-a", role: kAXTextFieldRole as String),
+                1: makeElementRecord(index: 1, identifier: nil, role: kAXStaticTextRole as String),
+            ]
+        )
+
+        let item = try! service.parseFillFormItem(["index": 0, "value": "hello"])
+        XCTAssertEqual(item.index, 0)
+        XCTAssertEqual(item.value, "hello")
+
+        // Identifier-backed fixture element writes; identifier-less one reports failure.
+        let ok = service.fillFormItem(item, query: "Fixture", snapshot: snapshot)
+        XCTAssertEqual(ok["ok"] as? Bool, true)
+        XCTAssertEqual(ok["index"] as? Int, 0)
+
+        let bad = service.fillFormItem(
+            try! service.parseFillFormItem(["index": 1, "value": "x"]),
+            query: "Fixture",
+            snapshot: snapshot
+        )
+        XCTAssertEqual(bad["ok"] as? Bool, false)
+        XCTAssertEqual(bad["error"] as? String, "fixture set_value requires a known element identifier")
+
+        XCTAssertEqual(service.fillFormItem(
+            try! service.parseFillFormItem(["index": 9, "value": "x"]),
+            query: "Fixture",
+            snapshot: snapshot
+        )["error"] as? String, "unknown element_index '9'")
+    }
+
+    func testFillFormRejectsMalformedItem() {
+        let service = ComputerUseService()
+        XCTAssertThrowsError(try service.parseFillFormItem(["value": "no-index"])) { error in
+            XCTAssertEqual(
+                (error as? ComputerUseError)?.errorDescription,
+                "invalidArguments(\"fill_form item requires an integer 'index'\")"
+            )
+        }
+    }
+
+    func testSnapshotIDPreservedOnSameStructureAndRegeneratedOnChange() {
+        let base = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            snapshotID: "snap-original",
+            elements: [0: makeElementRecord(index: 0, identifier: "a", role: kAXButtonRole as String)]
+        )
+
+        // Same structure, new id -> the prior id is preserved.
+        let sameStructure = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            snapshotID: "snap-fresh",
+            elements: [0: makeElementRecord(index: 0, identifier: "a", role: kAXButtonRole as String)]
+        )
+        XCTAssertEqual(sameStructure.preservingSnapshotID(from: base).snapshotID, "snap-original")
+
+        // Structure change -> the new id is kept.
+        let changed = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            snapshotID: "snap-fresh",
+            elements: [
+                0: makeElementRecord(index: 0, identifier: "a", role: kAXButtonRole as String),
+                1: makeElementRecord(index: 1, identifier: "b", role: kAXButtonRole as String),
+            ]
+        )
+        XCTAssertEqual(changed.preservingSnapshotID(from: base).snapshotID, "snap-fresh")
+
+        // No prior -> unchanged.
+        XCTAssertEqual(sameStructure.preservingSnapshotID(from: nil).snapshotID, "snap-fresh")
+    }
+
+    func testPerformWithStaleRetryRefreshesOnceAndSucceeds() throws {
+        let service = ComputerUseService()
+        var attempts: [String?] = []
+
+        let result = try service.performWithStaleRetry(
+            query: "Sample Chat",
+            snapshotID: "stale-id",
+            refresh: { "fresh-id" }
+        ) { effectiveID in
+            attempts.append(effectiveID)
+            if effectiveID == "stale-id" {
+                throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+            }
+            return ToolCallResult.text("ok: \(effectiveID ?? "nil")")
+        }
+
+        XCTAssertEqual(attempts, ["stale-id", "fresh-id"])
+        XCTAssertEqual(result.primaryText, "ok: fresh-id")
+    }
+
+    func testPerformWithStaleRetrySurfacesErrorWithoutSnapshotID() {
+        let service = ComputerUseService()
+        var refreshCalled = false
+
+        XCTAssertThrowsError(
+            try service.performWithStaleRetry(
+                query: "Sample Chat",
+                snapshotID: nil,
+                refresh: {
+                    refreshCalled = true
+                    return "fresh-id"
+                }
+            ) { _ in
+                throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+            }
+        ) { error in
+            XCTAssertEqual((error as? ComputerUseError)?.errorDescription, staleSnapshotErrorMessage)
+        }
+        XCTAssertFalse(refreshCalled)
+    }
+
+    func testNonSettableErrorMessageSuggestsNeighbor() {
+        let label = makeElementRecord(index: 5, identifier: nil, role: kAXStaticTextRole as String)
+        let field = makeElementRecord(index: 6, identifier: "real-field", role: kAXTextFieldRole as String)
+        let snapshot = makeSnapshot(
+            treeLines: [],
+            focusedSummary: nil,
+            elements: [5: label, 6: field]
+        )
+
+        let message = nonSettableSetValueErrorMessage(record: label, snapshot: snapshot)
+        XCTAssertTrue(message.contains(nonSettableSetValueErrorMessage))
+        XCTAssertTrue(message.contains("did you mean 6 (TextField)?"))
+    }
+
+    private func makeElementRecord(index: Int, identifier: String?, role: String?) -> ElementRecord {
+        ElementRecord(
+            index: index,
+            identifier: identifier,
+            element: nil,
+            localFrame: nil,
+            role: role,
+            rawActions: [],
+            prettyActions: []
+        )
+    }
+
+    private func makeSnapshot(
+        treeLines: [String],
+        focusedSummary: String?,
+        selectedText: String? = nil,
+        snapshotID: String = "00000000-0000-0000-0000-000000000000",
+        mode: SnapshotMode = .accessibility,
+        elements: [Int: ElementRecord] = [:]
+    ) -> AppSnapshot {
         AppSnapshot(
             app: RunningAppDescriptor(
                 name: "Sample Chat",
@@ -2317,17 +2846,18 @@ final class OpenComputerUseKitTests: XCTestCase {
                 pid: 18_465,
                 runningApplication: NSRunningApplication.current
             ),
+            snapshotID: snapshotID,
             windowTitle: "Sample Chat",
             windowBounds: nil,
             targetWindowID: nil,
             targetWindowLayer: nil,
             screenshotPNGData: nil,
-            mode: .accessibility,
+            mode: mode,
             treeLines: treeLines,
             focusedSummary: focusedSummary,
             focusedElement: nil,
             selectedText: selectedText,
-            elements: [:]
+            elements: elements
         )
     }
 
