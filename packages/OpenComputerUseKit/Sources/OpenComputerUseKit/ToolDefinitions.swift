@@ -32,12 +32,13 @@ public enum ToolDefinitions {
     public static let all: [ToolDefinition] = [
         ToolDefinition(
             name: "click",
-            description: "Click an element by index or pixel coordinates from screenshot. This tool is part of plugin `Computer Use`.",
+            description: "Click an element by index or pixel coordinates from screenshot. Requires the snapshot_id from the latest get_app_state. This tool is part of plugin `Computer Use`.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name or bundle identifier"),
-                    "element_index": stringProperty(description: "Element index to click"),
+                    "element_index": stringProperty(description: "Element index to click. Provide this or element_key."),
+                    "element_key": stringProperty(description: "Stable AX identifier of the element to click (the `ID:` shown in the tree). Prefer over element_index: it survives list reordering. Provide this or element_index."),
                     "x": numberProperty(description: "X coordinate in screenshot pixel coordinates"),
                     "y": numberProperty(description: "Y coordinate in screenshot pixel coordinates"),
                     "click_count": integerProperty(description: "Number of clicks. Defaults to 1"),
@@ -49,6 +50,20 @@ public enum ToolDefinitions {
                         description: "Click implementation: auto (default), accessibility, app_post, sky_click, or global. Accessibility requires element_index. app_post sends a public event directly to the target app. sky_click uses the macOS SkyLight background window path. Global may move the system pointer and requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1.",
                         enumValues: ClickMethod.allCases.map(\.rawValue)
                     ),
+                    "snapshot_id": snapshotIDProperty(),
+                ],
+                required: ["app", "snapshot_id"]
+            )
+        ),
+        ToolDefinition(
+            name: "focus_window",
+            description: "Raise and focus an already-running app's window so subsequent get_app_state snapshots target the correct window. Never launches the app: if the app is not running this fails with appNotFound. Optionally select a window by title substring or explicit pid, then verifies the frontmost window belongs to the app. This tool is part of plugin `Computer Use`.",
+            annotations: readOnlyAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "title_contains": stringProperty(description: "Case-insensitive substring of the target window title. Omit to focus the frontmost/main window."),
+                    "pid": integerProperty(description: "Explicit process id of the already-running app. Must match a running process."),
                 ],
                 required: ["app"]
             )
@@ -80,6 +95,7 @@ public enum ToolDefinitions {
                     "max_tree_depth": positiveIntegerProperty(description: "Maximum accessibility tree depth to render. Defaults to 64."),
                     "maxDimension": boundedIntegerProperty(description: "Longest edge of the returned window screenshot in pixels. Lower values shrink the image. Defaults to 1280.", minimum: 320, maximum: 4096),
                     "region": captureRegionProperty(description: "Crop the window screenshot to this rectangle, in per-window screenshot pixels. Returned coordinates stay per-window screenshot pixels, so a click at local (lx, ly) maps to window pixel (region.x + lx, region.y + ly). Omit to capture the whole window."),
+                    "title_hint": stringProperty(description: "Optional case-insensitive substring the snapshot window title must contain. On mismatch the call fails with staleSnapshot — call focus_window first. Omit for current behavior."),
                 ],
                 required: ["app"]
             )
@@ -137,21 +153,61 @@ public enum ToolDefinitions {
                 properties: [
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "element_index": stringProperty(description: "Element identifier"),
+                    "element_key": stringProperty(description: "Stable AX identifier of the element (the `ID:` shown in the tree). Prefer over element_index: it survives list reordering. Provide this or element_index."),
                     "value": stringProperty(description: "Value to assign"),
+                    "snapshot_id": snapshotIDProperty(),
                 ],
-                required: ["app", "element_index", "value"]
+                required: ["app", "value", "snapshot_id"]
             )
         ),
         ToolDefinition(
             name: "type_text",
-            description: "Type literal text using keyboard input. This tool is part of plugin `Computer Use`.",
+            description: "Type literal text using keyboard input. Requires the snapshot_id from the latest get_app_state. This tool is part of plugin `Computer Use`.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "text": stringProperty(description: "Literal text to type"),
+                    "snapshot_id": snapshotIDProperty(),
                 ],
-                required: ["app", "text"]
+                required: ["app", "text", "snapshot_id"]
+            )
+        ),
+        ToolDefinition(
+            name: "select_option",
+            description: "Select an option from a popup button/menu by visible label. Opens the popup, presses the matching menu item (case-insensitive substring), then dismisses the menu with Escape and verifies it closed. Requires the snapshot_id from the latest get_app_state. This tool is part of plugin `Computer Use`.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "element_index": stringProperty(description: "Popup button element index to open"),
+                    "option": stringProperty(description: "Visible menu item text to select (case-insensitive substring match)"),
+                    "snapshot_id": snapshotIDProperty(),
+                ],
+                required: ["app", "element_index", "option", "snapshot_id"]
+            )
+        ),
+        ToolDefinition(
+            name: "fill_form",
+            description: "Set values on up to 30 elements in one call from a single snapshot. Validates the snapshot once, writes each field natively with no intermediate refresh, and returns per-item results plus the next snapshot_id. Continue-on-error: each item reports ok or an error. Requires the snapshot_id from the latest get_app_state. This tool is part of plugin `Computer Use`.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "items": arrayProperty(
+                        description: "Fields to fill, in order. Each item is {index: integer, value: string}.",
+                        itemSchema: objectSchema(
+                            properties: [
+                                "index": integerProperty(description: "Element index to set"),
+                                "value": stringProperty(description: "Value to assign"),
+                            ],
+                            required: ["index", "value"]
+                        ),
+                        maximum: 30
+                    ),
+                    "snapshot_id": snapshotIDProperty(),
+                ],
+                required: ["app", "items", "snapshot_id"]
             )
         ),
     ]
@@ -207,6 +263,20 @@ private func integerProperty(description: String) -> [String: Any] {
     ]
 }
 
+private func arrayProperty(description: String, itemSchema: [String: Any], maximum: Int? = nil) -> [String: Any] {
+    var property: [String: Any] = [
+        "type": "array",
+        "description": description,
+        "items": itemSchema,
+    ]
+
+    if let maximum {
+        property["maxItems"] = maximum
+    }
+
+    return property
+}
+
 private func positiveIntegerProperty(description: String) -> [String: Any] {
     [
         "type": "integer",
@@ -260,4 +330,10 @@ private func numberProperty(description: String) -> [String: Any] {
         "type": "number",
         "description": description,
     ]
+}
+
+private func snapshotIDProperty() -> [String: Any] {
+    stringProperty(
+        description: "Required snapshot ID from the latest get_app_state (its `Snapshot ID:` line). If it does not match the current snapshot, the action is rejected as stale — call get_app_state again."
+    )
 }

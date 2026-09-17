@@ -9,6 +9,11 @@ public enum ComputerUseError: Error, LocalizedError {
     case appNotFound(String)
     case permissionDenied(String)
     case stateUnavailable(String)
+    case staleSnapshot(String)
+    case staleElement(String)
+    case focusFailed(String)
+    case optionNotFound(String)
+    case dismissFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -24,11 +29,32 @@ public enum ComputerUseError: Error, LocalizedError {
             return message
         case .stateUnavailable(let message):
             return message
+        case .staleSnapshot(let message):
+            return message
+        case .staleElement(let message):
+            return message
+        case .focusFailed(let message):
+            return message
+        case .optionNotFound(let message):
+            return message
+        case .dismissFailed(let message):
+            return message
         }
     }
 
     var toolResultIsError: Bool {
         true
+    }
+
+    /// True for the recoverable "your snapshot is out of date" failures. These
+    /// are retried once internally after a native refresh before surfacing.
+    var isStale: Bool {
+        switch self {
+        case .staleSnapshot, .staleElement:
+            return true
+        default:
+            return false
+        }
     }
 }
 

@@ -57,7 +57,14 @@ public final class ComputerUseToolDispatcher {
                 ),
                 screenshotMaxDimension: try optionalScreenshotMaxDimension(in: arguments)
                     ?? screenshotResultMaxDimension,
-                screenshotRegion: try optionalCaptureRegion(in: arguments)
+                screenshotRegion: try optionalCaptureRegion(in: arguments),
+                titleHint: optionalString("title_hint", in: arguments)
+            )
+        case "focus_window":
+            return try service.focusWindow(
+                app: requireString("app", in: arguments),
+                titleContains: optionalString("title_contains", in: arguments),
+                pid: optionalInt("pid", in: arguments)
             )
         case "click":
             return try service.click(
@@ -67,7 +74,9 @@ public final class ComputerUseToolDispatcher {
                 y: optionalDouble("y", in: arguments),
                 clickCount: Int(optionalDouble("click_count", in: arguments) ?? 1),
                 mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
-                clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
+                clickMethod: try parseClickMethod(optionalString("click_method", in: arguments)),
+                snapshotID: optionalString("snapshot_id", in: arguments),
+                elementKey: optionalString("element_key", in: arguments)
             )
         case "perform_secondary_action":
             return try service.performSecondaryAction(
@@ -93,7 +102,8 @@ public final class ComputerUseToolDispatcher {
         case "type_text":
             return try service.typeText(
                 app: requireString("app", in: arguments),
-                text: requireString("text", in: arguments)
+                text: requireString("text", in: arguments),
+                snapshotID: optionalString("snapshot_id", in: arguments)
             )
         case "press_key":
             return try service.pressKey(
@@ -103,8 +113,23 @@ public final class ComputerUseToolDispatcher {
         case "set_value":
             return try service.setValue(
                 app: requireString("app", in: arguments),
+                elementIndex: optionalElementIndex(in: arguments),
+                value: requireString("value", in: arguments),
+                snapshotID: optionalString("snapshot_id", in: arguments),
+                elementKey: optionalString("element_key", in: arguments)
+            )
+        case "select_option":
+            return try service.selectOption(
+                app: requireString("app", in: arguments),
                 elementIndex: requireElementIndex(in: arguments),
-                value: requireString("value", in: arguments)
+                option: requireString("option", in: arguments),
+                snapshotID: optionalString("snapshot_id", in: arguments)
+            )
+        case "fill_form":
+            return try service.fillForm(
+                app: requireString("app", in: arguments),
+                items: try requireItems(in: arguments),
+                snapshotID: optionalString("snapshot_id", in: arguments)
             )
         default:
             throw ComputerUseError.unsupportedTool(name)
@@ -161,6 +186,24 @@ public final class ComputerUseToolDispatcher {
         return value
     }
 
+    private func requireItems(in arguments: [String: Any]) throws -> [[String: Any]] {
+        guard let rawItems = arguments["items"] as? [Any] else {
+            throw ComputerUseError.missingArgument("items")
+        }
+
+        guard !rawItems.isEmpty else {
+            throw ComputerUseError.invalidArguments("items must contain at least one {index, value}")
+        }
+
+        return try rawItems.map { rawItem in
+            guard let item = rawItem as? [String: Any] else {
+                throw ComputerUseError.invalidArguments("each items entry must be an object with index and value")
+            }
+
+            return item
+        }
+    }
+
     private func optionalElementIndex(in arguments: [String: Any]) -> String? {
         normalizedElementIndexArgument(arguments["element_index"])
     }
@@ -184,6 +227,26 @@ public final class ComputerUseToolDispatcher {
 
         if let number = arguments[key] as? NSNumber {
             return number.doubleValue
+        }
+
+        return nil
+    }
+
+    private func optionalInt(_ key: String, in arguments: [String: Any]) -> Int? {
+        if let integer = arguments[key] as? Int {
+            return integer
+        }
+
+        if let double = arguments[key] as? Double, double.rounded(.towardZero) == double,
+           double >= Double(Int.min), double <= Double(Int.max)
+        {
+            return Int(double)
+        }
+
+        if let number = arguments[key] as? NSNumber,
+           CFGetTypeID(number as CFTypeRef) != CFBooleanGetTypeID()
+        {
+            return number.intValue
         }
 
         return nil

@@ -122,6 +122,7 @@ public struct CaptureRegion: Equatable {
 
 public struct AppSnapshot {
     public let app: RunningAppDescriptor
+    public let snapshotID: String
     public let windowTitle: String?
     public let windowBounds: CGRect?
     let targetWindowID: CGWindowID?
@@ -156,16 +157,70 @@ public struct AppSnapshot {
             lines.append("The focused UI element is \(focusedSummary).")
         }
 
+        if style == .fullState {
+            lines.append("")
+            lines.append("Snapshot ID: \(snapshotID)")
+        }
+
         return lines.joined(separator: "\n")
     }
 }
 
-public enum SnapshotTextStyle {
+public enum SnapshotTextStyle: Equatable {
     case fullState
     case actionResult
 }
 
+extension AppSnapshot {
+    /// Stable identity of the rendered element structure: element count plus the
+    /// ordered role/identifier sequence. When this is unchanged across a refresh
+    /// the snapshot id is preserved so callers can reuse one id across consecutive
+    /// actions instead of forcing a get_app_state per field.
+    var structureSignature: String {
+        elements.keys.sorted().map { index -> String in
+            let record = elements[index]
+            return "\(index):\(record?.role ?? ""):\(record?.identifier ?? "")"
+        }.joined(separator: "|")
+    }
+
+    /// Reuses `prior`'s snapshot id when the element structure is unchanged, so
+    /// consecutive actions can share one id. A structure change yields `self`.
+    func preservingSnapshotID(from prior: AppSnapshot?) -> AppSnapshot {
+        guard let prior, prior.mode == mode, prior.structureSignature == structureSignature else {
+            return self
+        }
+
+        return withSnapshotID(prior.snapshotID)
+    }
+
+    func withSnapshotID(_ snapshotID: String) -> AppSnapshot {        AppSnapshot(
+            app: app,
+            snapshotID: snapshotID,
+            windowTitle: windowTitle,
+            windowBounds: windowBounds,
+            targetWindowID: targetWindowID,
+            targetWindowLayer: targetWindowLayer,
+            screenshotPNGData: screenshotPNGData,
+            mode: mode,
+            treeLines: treeLines,
+            focusedSummary: focusedSummary,
+            focusedElement: focusedElement,
+            selectedText: selectedText,
+            elements: elements
+        )
+    }
+}
+
 enum SnapshotBuilder {
+    static func currentWindow(appElement: AXUIElement, appPID: pid_t, focusedApplication: AXUIElement?) -> AXUIElement? {
+        preferredFocusedWindow(
+            appElement: appElement,
+            appPID: appPID,
+            focusedApplication: focusedApplication,
+            systemWide: AXUIElementCreateSystemWide()
+        )
+    }
+
     static func build(
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,
@@ -270,6 +325,7 @@ enum SnapshotBuilder {
 
         return AppSnapshot(
             app: app,
+            snapshotID: UUID().uuidString,
             windowTitle: windowTitle,
             windowBounds: windowBounds,
             targetWindowID: windowCapture.windowID,
@@ -287,16 +343,20 @@ enum SnapshotBuilder {
     private static func recoverVisibleWindow(for app: RunningAppDescriptor, appElement: AXUIElement, preferredWindow: AXUIElement?) -> Bool {
         var recovered = false
 
-        if let runningApplication = NSRunningApplication(processIdentifier: app.pid) {
-            recovered = runningApplication.unhide() || recovered
-            recovered = runningApplication.activate(options: [.activateAllWindows]) || recovered
+        if preferredWindow == nil {
+            // Only broad app-level activation is allowed when we do not yet know
+            // which window to target; raising app-wide can bring up a different window.
+            if let runningApplication = NSRunningApplication(processIdentifier: app.pid) {
+                recovered = runningApplication.unhide() || recovered
+                recovered = runningApplication.activate(options: [.activateAllWindows]) || recovered
+            }
+
+            if let bundleIdentifier = app.bundleIdentifier {
+                recovered = openBundleIdentifier(bundleIdentifier) || recovered
+            }
         }
 
-        if let bundleIdentifier = app.bundleIdentifier {
-            recovered = openBundleIdentifier(bundleIdentifier) || recovered
-        }
-
-        if let window = preferredWindow ?? firstAnyWindow(for: appElement) {
+        if let window = preferredWindow ?? mainWindow(for: appElement) {
             recovered = unminimize(window) || recovered
             recovered = raise(window) || recovered
             recovered = setBoolAttribute(named: kAXMainAttribute as String, on: window) || recovered
@@ -327,6 +387,10 @@ enum SnapshotBuilder {
     }
 
     private static func firstWindow(for appElement: AXUIElement) -> AXUIElement? {
+        if let mainWindow = mainWindow(for: appElement) {
+            return mainWindow
+        }
+
         guard let windows = copyArray(appElement, attribute: kAXWindowsAttribute) else {
             return nil
         }
@@ -334,9 +398,8 @@ enum SnapshotBuilder {
         return windows.first(where: isUsableWindowElement(_:))
     }
 
-    private static func firstAnyWindow(for appElement: AXUIElement) -> AXUIElement? {
-        copyElement(appElement, attribute: kAXFocusedWindowAttribute)
-            ?? copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: { stringValue(of: $0, attribute: kAXRoleAttribute) == kAXWindowRole as String })
+    private static func mainWindow(for appElement: AXUIElement) -> AXUIElement? {
+        usableWindowElement(from: copyElement(appElement, attribute: kAXMainWindowAttribute))
     }
 
     private static func unminimize(_ window: AXUIElement) -> Bool {
@@ -426,6 +489,7 @@ enum SnapshotBuilder {
 
         return AppSnapshot(
             app: app,
+            snapshotID: UUID().uuidString,
             windowTitle: state.windowTitle,
             windowBounds: state.windowBounds.cgRect,
             targetWindowID: nil,
@@ -441,7 +505,7 @@ enum SnapshotBuilder {
     }
 }
 
-private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
+func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) {
     // Chromium/Electron apps may withhold parts of their AX tree until manual
     // accessibility is enabled. These private attributes are best-effort and
     // harmlessly fail on apps that do not support them.
@@ -1150,7 +1214,7 @@ private func valueTypeTrait(of element: AXUIElement) -> String? {
     return nil
 }
 
-private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
+func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     guard error == .success, let value else {
@@ -1160,7 +1224,7 @@ private func copyElement(_ element: AXUIElement, attribute: String) -> AXUIEleme
     return (value as! AXUIElement)
 }
 
-private func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
+func copyArray(_ element: AXUIElement, attribute: String) -> [AXUIElement]? {
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     guard error == .success, let value else {
@@ -1190,7 +1254,7 @@ private func attributeValue(of element: AXUIElement, attribute: String) -> CFTyp
     return value
 }
 
-private func stringValue(of element: AXUIElement, attribute: String) -> String? {
+func stringValue(of element: AXUIElement, attribute: String) -> String? {
     guard let value = attributeValue(of: element, attribute: attribute) else {
         return nil
     }
@@ -1223,10 +1287,19 @@ private func boolValue(of element: AXUIElement, attribute: String) -> Bool? {
     return value as? Bool
 }
 
-private func pid(of element: AXUIElement) -> pid_t {
+func pid(of element: AXUIElement) -> pid_t {
     var processIdentifier: pid_t = 0
     AXUIElementGetPid(element, &processIdentifier)
     return processIdentifier
+}
+
+/// Probes an AX element handle to determine whether it still resolves.
+/// There is no public `AXUIElementIsValid`, so we read the role attribute and
+/// treat an explicit `.invalidUIElement` result as a stale handle.
+func axElementIsValid(_ element: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    let error = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+    return error != .invalidUIElement
 }
 
 private func isSettable(of element: AXUIElement, attribute: String) -> Bool {

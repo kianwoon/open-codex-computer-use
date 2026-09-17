@@ -256,8 +256,211 @@ func screenshotPixelToWindowPoint(
 }
 
 let nonSettableSetValueErrorMessage = "Cannot set a value for an element that is not settable"
+let settableTextRoles: Set<String> = [
+    kAXTextFieldRole as String,
+    "AXSecureTextField",
+    kAXComboBoxRole as String,
+]
+
+/// When the caller points `set_value` at a label (e.g. a StaticText sibling of
+/// the real field), append the nearest settable text neighbor so the model can
+/// self-correct without another `get_app_state` roundtrip.
+func nonSettableSetValueErrorMessage(record: ElementRecord, snapshot: AppSnapshot) -> String {
+    let targetRole = displaySetValueRole(record.role)
+    let targetLabel = setValueElementLabel(record: record)
+    var message = "\(nonSettableSetValueErrorMessage): element \(record.index) is \(targetRole)"
+
+    if let targetLabel {
+        message += " '\(targetLabel)'"
+    }
+
+    guard let neighbor = nearestSettableTextNeighbor(around: record.index, in: snapshot) else {
+        return message
+    }
+
+    return message + "; did you mean \(neighbor.index) (\(displaySetValueRole(neighbor.role)))?"
+}
+
+/// Scans ±3 indices for the first settable text field/secure field/combobox.
+func nearestSettableTextNeighbor(around index: Int, in snapshot: AppSnapshot) -> (index: Int, role: String?)? {
+    for offset in 1...3 {
+        for candidate in [index + offset, index - offset] {
+            guard let record = snapshot.elements[candidate],
+                  let role = record.role,
+                  settableTextRoles.contains(role)
+            else {
+                continue
+            }
+
+            return (candidate, role)
+        }
+    }
+
+    return nil
+}
+
+func optionNotFoundMessage(option: String, elementIndex: String, availableTitles: [String]) -> String {
+    let available = availableTitles.joined(separator: ", ")
+    return "no menu item matching '\(option)' for element \(elementIndex)"
+        + (available.isEmpty ? "" : " (available: \(available))")
+}
+
+/// A menu/popup choice reduced to the fields that matter for matching. Native
+/// HTML selects surface menu items under a transient AXMenu window (not the
+/// popup subtree) and often as AXRow/AXCell rather than AXMenuItem, so matching
+/// must not assume the popup subtree or the AXMenuItem role.
+struct MenuOptionCandidate: Equatable {
+    let role: String?
+    let title: String?
+    let value: String?
+}
+
+func isSelectableMenuOptionRole(_ role: String?) -> Bool {
+    switch role {
+    case kAXMenuItemRole as String,
+         kAXRowRole as String,
+         "AXCell",
+         kAXStaticTextRole as String:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Case-insensitive substring match against both the title and the value, since
+/// native selects sometimes carry the label only in AXValue.
+func menuOptionCandidateMatches(_ candidate: MenuOptionCandidate, option: String) -> Bool {
+    guard isSelectableMenuOptionRole(candidate.role) else {
+        return false
+    }
+
+    return [candidate.title, candidate.value]
+        .compactMap { $0 }
+        .contains { !$0.isEmpty && $0.range(of: option, options: .caseInsensitive) != nil }
+}
+
+func firstMatchingMenuOptionIndex(in candidates: [MenuOptionCandidate], option: String) -> Int? {
+    candidates.firstIndex { menuOptionCandidateMatches($0, option: option) }
+}
+
+enum FocusVerificationOutcome: Equatable {
+    case focused
+    case retry
+    case failed
+}
+
+func focusTitleMatches(_ focusedTitle: String?, _ expectedTitle: String?) -> Bool {
+    expectedTitle == nil || focusedTitle == expectedTitle || (focusedTitle?.isEmpty ?? true)
+}
+
+/// Decides whether a raised window counts as focused. The system-wide
+/// `kAXFocusedWindowAttribute` is nil (pid 0) whenever our process is not the
+/// active app, so a pid-0 read is only accepted when the target app is the
+/// frontmost application and it exposes its main window — never when a
+/// different app is frontmost.
+func focusVerificationOutcome(
+    focusedPID: pid_t,
+    focusedTitle: String?,
+    appPID: pid_t,
+    expectedTitle: String?,
+    frontmostAppPID: pid_t?,
+    targetMainWindowTitle: String?
+) -> FocusVerificationOutcome {
+    if focusedPID == appPID, focusTitleMatches(focusedTitle, expectedTitle) {
+        return .focused
+    }
+
+    if focusedPID == 0 {
+        guard frontmostAppPID == appPID, targetMainWindowTitle != nil else {
+            return .failed
+        }
+        return focusTitleMatches(targetMainWindowTitle, expectedTitle) ? .focused : .retry
+    }
+
+    if frontmostAppPID == appPID {
+        return .retry
+    }
+
+    return .failed
+}
+
+func displaySetValueRole(_ role: String?) -> String {    switch role {
+    case kAXTextFieldRole as String:
+        return "TextField"
+    case "AXSecureTextField":
+        return "SecureTextField"
+    case kAXComboBoxRole as String:
+        return "ComboBox"
+    case kAXStaticTextRole as String:
+        return "StaticText"
+    case let role?:
+        return role
+    default:
+        return "element"
+    }
+}
+
+func setValueElementLabel(record: ElementRecord) -> String? {
+    guard let element = record.element else {
+        return record.identifier
+    }
+
+    for attribute in [kAXTitleAttribute as String, kAXDescriptionAttribute as String, kAXPlaceholderValueAttribute as String] {
+        if let value = stringValue(of: element, attribute: attribute), !value.isEmpty {
+            return value
+        }
+    }
+
+    return record.identifier
+}
+let staleSnapshotErrorMessage = "stale snapshot — call get_app_state again"
+let staleElementErrorMessage = "stale element handle — call get_app_state again"
+let snapshotIDRequiredErrorMessage = "snapshot_id required — pass Snapshot ID from latest get_app_state"
+
+/// Ensures an action carries the snapshot id from the latest `get_app_state`.
+/// A missing or mismatched id means the caller is acting on stale data.
+func requireSnapshotID(_ provided: String?) throws {
+    guard let provided, !provided.isEmpty else {
+        throw ComputerUseError.staleSnapshot(snapshotIDRequiredErrorMessage)
+    }
+}
+
+func validateSnapshotIDValue(_ provided: String?, snapshot: AppSnapshot) throws {
+    try requireSnapshotID(provided)
+
+    guard provided == snapshot.snapshotID else {
+        throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+    }
+}
+
+/// Optional `title_hint` guard for `get_app_state`: when provided, the built
+/// snapshot's window title must contain the hint (case-insensitive).
+func validateWindowTitleHint(_ hint: String?, snapshot: AppSnapshot) throws {
+    guard let normalizedHint = hint?.trimmingCharacters(in: .whitespacesAndNewlines), !normalizedHint.isEmpty else {
+        return
+    }
+
+    let title = snapshot.windowTitle ?? ""
+    guard title.range(of: normalizedHint, options: .caseInsensitive) != nil else {
+        throw ComputerUseError.staleSnapshot(
+            "window mismatch: expected '\(normalizedHint)', got '\(title)' — call focus_window first"
+        )
+    }
+}
+
+/// Click safety gate: a click target must belong to the snapshot's app. A
+/// mismatched pid means we would be clicking/activating a different app.
+func validateClickOwnership(elementPID: pid_t, snapshotPID: pid_t) throws {
+    guard elementPID == snapshotPID else {
+        throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+    }
+}
 
 func setValueAttributeIsSettable(result: AXError, settable: Bool, attribute: String) throws -> Bool {
+    if result == .invalidUIElement {
+        throw ComputerUseError.staleElement(staleElementErrorMessage)
+    }
+
     guard result == .success else {
         throw ComputerUseError.message("AXUIElementIsAttributeSettable(\(attribute)) failed with \(result.rawValue)")
     }
@@ -464,17 +667,113 @@ public final class ComputerUseService {
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
         screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
-        screenshotRegion: CaptureRegion? = nil
+        screenshotRegion: CaptureRegion? = nil,
+        titleHint: String? = nil
     ) throws -> ToolCallResult {
-        snapshotResult(
-            for: try refreshSnapshot(
-                for: query,
-                textLimit: textLimit,
-                treeLimits: treeLimits,
-                screenshotMaxDimension: screenshotMaxDimension,
-                screenshotRegion: screenshotRegion
-            ),
-            style: .fullState
+        let snapshot = try refreshSnapshot(
+            for: query,
+            textLimit: textLimit,
+            treeLimits: treeLimits,
+            screenshotMaxDimension: screenshotMaxDimension,
+            screenshotRegion: screenshotRegion
+        )
+        try validateWindowTitleHint(titleHint, snapshot: snapshot)
+        return snapshotResult(for: snapshot, style: .fullState)
+    }
+
+    /// Raises and activates an already-running app's window without ever
+    /// launching the app. When `titleContains` is nil the frontmost/main window
+    /// is used. After raising, verifies the system-wide focused window belongs
+    /// to the target pid and its title matches, otherwise throws `focusFailed`.
+    public func focusWindow(app query: String, titleContains: String? = nil, pid: Int? = nil) throws -> ToolCallResult {
+        let explicitPID = pid.map { pid_t($0) }
+        let app = try AppDiscovery.resolveRunningOnly(query, pid: explicitPID)
+        let appElement = AXUIElementCreateApplication(app.pid)
+        enableBestEffortAccessibilityModes(appElement)
+
+        let windows = copyArray(appElement, attribute: kAXWindowsAttribute) ?? []
+        guard !windows.isEmpty else {
+            throw ComputerUseError.focusFailed("no windows for app '\(app.name)' (pid \(app.pid))")
+        }
+
+        let normalizedTitle = titleContains?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetWindow: AXUIElement
+        if let normalizedTitle, !normalizedTitle.isEmpty {
+            guard let matched = windows.first(where: { window in
+                guard let title = stringValue(of: window, attribute: kAXTitleAttribute) else {
+                    return false
+                }
+                return title.range(of: normalizedTitle, options: .caseInsensitive) != nil
+            }) else {
+                let available = windows
+                    .compactMap { stringValue(of: $0, attribute: kAXTitleAttribute) }
+                    .joined(separator: ", ")
+                throw ComputerUseError.focusFailed(
+                    "no window title contains '\(normalizedTitle)' for app '\(app.name)' (available: \(available))"
+                )
+            }
+            targetWindow = matched
+        } else {
+            let systemWide = AXUIElementCreateSystemWide()
+            let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
+            targetWindow = SnapshotBuilder.currentWindow(
+                appElement: appElement,
+                appPID: app.pid,
+                focusedApplication: focusedApplication
+            ) ?? windows[0]
+        }
+
+        let expectedTitle = stringValue(of: targetWindow, attribute: kAXTitleAttribute)
+        _ = AXUIElementSetAttributeValue(targetWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        _ = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        _ = app.runningApplication.activate(options: [.activateAllWindows])
+
+        try verifyFrontmostWindow(app: app, expectedTitle: expectedTitle)
+
+        return ToolCallResult.text(
+            "Focused window '\(expectedTitle ?? "")' of \(app.name) (pid \(app.pid))."
+        )
+    }
+
+    private func verifyFrontmostWindow(app: RunningAppDescriptor, expectedTitle: String?) throws {
+        let systemWide = AXUIElementCreateSystemWide()
+        let appElement = AXUIElementCreateApplication(app.pid)
+
+        // The window server needs a beat to finish AXRaise + activation; the
+        // system-wide focused window is also nil while our process is inactive,
+        // so retry up to 3 attempts over ~1.5s before deciding.
+        for _ in 0..<3 {
+            Thread.sleep(forTimeInterval: 0.5)
+
+            let focusedWindow = copyElement(systemWide, attribute: kAXFocusedWindowAttribute)
+            let focusedPID = focusedWindow.map { pid(of: $0) } ?? 0
+            let focusedTitle = focusedWindow.flatMap { stringValue(of: $0, attribute: kAXTitleAttribute) }
+            let mainWindow = copyElement(appElement, attribute: kAXMainWindowAttribute)
+            let mainWindowTitle = mainWindow.flatMap { stringValue(of: $0, attribute: kAXTitleAttribute) }
+            let frontmostAppPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+
+            let outcome = focusVerificationOutcome(
+                focusedPID: focusedPID,
+                focusedTitle: focusedTitle,
+                appPID: app.pid,
+                expectedTitle: expectedTitle,
+                frontmostAppPID: frontmostAppPID,
+                targetMainWindowTitle: mainWindowTitle
+            )
+
+            switch outcome {
+            case .focused:
+                return
+            case .retry, .failed:
+                continue
+            }
+        }
+
+        let focusedWindow = copyElement(systemWide, attribute: kAXFocusedWindowAttribute)
+        let focusedPID = focusedWindow.map { pid(of: $0) } ?? 0
+        let focusedTitle = focusedWindow.flatMap { stringValue(of: $0, attribute: kAXTitleAttribute) } ?? ""
+        throw ComputerUseError.focusFailed(
+            "frontmost window is pid \(focusedPID) '\(focusedTitle)', expected pid \(app.pid) '\(expectedTitle ?? "")'"
         )
     }
 
@@ -485,11 +784,61 @@ public final class ComputerUseService {
         y: Double?,
         clickCount: Int,
         mouseButton: String,
-        clickMethod: ClickMethod = .auto
+        clickMethod: ClickMethod = .auto,
+        snapshotID: String? = nil,
+        elementKey: String? = nil
+    ) throws -> ToolCallResult {
+        try performWithStaleRetry(query: query, snapshotID: snapshotID) { effectiveID in
+            try performClick(
+                app: query,
+                elementIndex: elementIndex,
+                x: x,
+                y: y,
+                clickCount: clickCount,
+                mouseButton: mouseButton,
+                clickMethod: clickMethod,
+                snapshotID: effectiveID,
+                elementKey: elementKey
+            )
+        }
+    }
+
+    /// Runs `body`; on a stale snapshot/element failure it refreshes the
+    /// snapshot natively once and retries with the fresh id. Callers only see
+    /// the error if the second attempt is also stale, turning two LLM
+    /// roundtrips into zero for the common stale-handle case.
+    func performWithStaleRetry(
+        query: String,
+        snapshotID: String?,
+        refresh: (() throws -> String)? = nil,
+        _ body: (String?) throws -> ToolCallResult
+    ) throws -> ToolCallResult {
+        do {
+            return try body(snapshotID)
+        } catch let error as ComputerUseError where error.isStale {
+            guard snapshotID != nil else {
+                throw error
+            }
+
+            let refreshedID = try refresh?() ?? refreshSnapshot(for: query, allowLaunch: false).snapshotID
+            return try body(refreshedID)
+        }
+    }
+
+    private func performClick(
+        app query: String,
+        elementIndex: String?,
+        x: Double?,
+        y: Double?,
+        clickCount: Int,
+        mouseButton: String,
+        clickMethod: ClickMethod = .auto,
+        snapshotID: String? = nil,
+        elementKey: String? = nil
     ) throws -> ToolCallResult {
         try validateClickMethod(
             clickMethod,
-            hasElementIndex: elementIndex != nil,
+            hasElementIndex: elementIndex != nil || elementKey != nil,
             environment: ProcessInfo.processInfo.environment
         )
         try validateSkyClickArguments(
@@ -497,8 +846,11 @@ public final class ComputerUseService {
             mouseButton: mouseButton,
             clickCount: clickCount
         )
+        try requireSnapshotID(snapshotID)
 
-        let snapshot = try currentSnapshot(for: query)
+        let snapshot = try currentSnapshot(for: query, allowLaunch: false)
+        try validateSnapshotID(snapshotID, snapshot: snapshot)
+        try revalidateClickWindow(snapshot: snapshot)
         let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
         if snapshot.mode == .fixture {
             guard clickMethod == .auto else {
@@ -508,8 +860,8 @@ public final class ComputerUseService {
             }
 
             let cursorTarget: VisualCursorTarget?
-            if let elementIndex {
-                let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+            if elementIndex != nil || elementKey != nil {
+                let record = try lookupElement(snapshot: snapshot, index: elementIndex, elementKey: elementKey)
                 guard let identifier = record.identifier else {
                     throw ComputerUseError.invalidArguments("fixture click requires an identifier-backed element")
                 }
@@ -530,10 +882,12 @@ public final class ComputerUseService {
             return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
         }
 
-        if let elementIndex {
-            let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        if elementIndex != nil || elementKey != nil {
+            let record = try lookupElement(snapshot: snapshot, index: elementIndex, elementKey: elementKey)
+            let targetDescription = record.identifier.map { "element_key=\($0)" } ?? "element_index=\(elementIndex ?? "")"
+            try validateClickElement(record: record, snapshot: snapshot)
             guard let windowPoint = clickPoint(for: record, snapshot: snapshot) else {
-                throw ComputerUseError.stateUnavailable("element \(elementIndex) has no clickable frame")
+                throw ComputerUseError.stateUnavailable("element \(targetDescription) has no clickable frame")
             }
             let targetPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: windowPoint)
             let cursorTarget = makeVisualCursorTarget(
@@ -559,7 +913,7 @@ public final class ComputerUseService {
                             at: targetPoint,
                             button: button,
                             clickCount: clickCount,
-                            targetDescription: "element_index=\(elementIndex)",
+                            targetDescription: targetDescription,
                             snapshot: snapshot
                         )
                     }
@@ -573,7 +927,7 @@ public final class ComputerUseService {
                         allowActivationFallback: true
                     ) else {
                         throw ComputerUseError.message(
-                            "click_method 'accessibility' could not click element_index=\(elementIndex)"
+                            "click_method 'accessibility' could not click \(targetDescription)"
                         )
                     }
                 case .appPost, .skyClick, .global:
@@ -583,7 +937,7 @@ public final class ComputerUseService {
                         windowPoint: windowPoint,
                         button: button,
                         clickCount: clickCount,
-                        targetDescription: "element_index=\(elementIndex)",
+                        targetDescription: targetDescription,
                         snapshot: snapshot
                     )
                 }
@@ -593,6 +947,7 @@ public final class ComputerUseService {
             }
 
             pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+            dismissMenuAfterMenuClick(snapshot: snapshot, record: record)
         } else if let x, let y {
             let screenshotPoint = CGPoint(x: x, y: y)
             let point = screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: screenshotPoint)
@@ -659,10 +1014,394 @@ public final class ComputerUseService {
         return snapshotResult(
             for: try refreshSnapshot(
                 for: query,
-                recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod)
+                recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod),
+                allowLaunch: false
             ),
             style: .actionResult
         )
+    }
+
+    public func selectOption(
+        app query: String,
+        elementIndex: String,
+        option: String,
+        snapshotID: String? = nil
+    ) throws -> ToolCallResult {
+        try requireSnapshotID(snapshotID)
+        let snapshot = try currentSnapshot(for: query, allowLaunch: false)
+        try validateSnapshotID(snapshotID, snapshot: snapshot)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+
+        if snapshot.mode == .fixture {
+            guard let identifier = record.identifier else {
+                throw ComputerUseError.invalidArguments("fixture select_option requires an identifier-backed element")
+            }
+
+            try FixtureBridge.post(FixtureCommand(kind: "select_option", identifier: identifier, value: option))
+            Thread.sleep(forTimeInterval: 0.15)
+            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        }
+
+        guard let element = record.element else {
+            throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
+        }
+
+        guard axElementIsValid(element) else {
+            throw ComputerUseError.staleElement(staleElementErrorMessage)
+        }
+
+        try validateClickOwnership(elementPID: pid(of: element), snapshotPID: snapshot.app.pid)
+
+        // Open the popup.
+        let pressResult = AXUIElementPerformAction(element, kAXPressAction as CFString)
+        guard pressResult == .success else {
+            throw ComputerUseError.message("AXUIElementPerformAction(AXPress) on popup \(elementIndex) failed with \(pressResult.rawValue)")
+        }
+
+        let appElement = AXUIElementCreateApplication(snapshot.app.pid)
+        guard let menuItem = waitForMenuItem(titleContaining: option, in: element, appElement: appElement, pid: snapshot.app.pid) else {
+            throw ComputerUseError.optionNotFound(
+                optionNotFoundMessage(
+                    option: option,
+                    elementIndex: elementIndex,
+                    availableTitles: menuItemTitles(in: element, appElement: appElement)
+                )
+            )
+        }
+
+        let itemPress = AXUIElementPerformAction(menuItem.element, kAXPressAction as CFString)
+        guard itemPress == .success else {
+            throw ComputerUseError.optionNotFound(
+                "AXUIElementPerformAction(AXPress) on menu item '\(menuItem.title)' failed with \(itemPress.rawValue)"
+            )
+        }
+
+        Thread.sleep(forTimeInterval: 0.15)
+        let dismissal = dismissMenu(pid: snapshot.app.pid)
+        guard dismissal.dismissed else {
+            throw ComputerUseError.dismissFailed(dismissal.message)
+        }
+
+        return snapshotResult(for: try refreshSnapshot(for: query, allowLaunch: false), style: .actionResult)
+    }
+
+    /// Selects one item from a popup/menu. Opens via AXPress, polls for a
+    /// matching menu-item child (case-insensitive substring on title or value),
+    /// presses it, then posts Escape and verifies the menu is gone so it never
+    /// stays open.
+    private struct MenuItemMatch {
+        let element: AXUIElement
+        let title: String
+    }
+
+    private struct MenuDismissal {
+        let dismissed: Bool
+        let message: String
+    }
+
+    /// Native selects render their menu under a transient AXMenu window owned by
+    /// the app rather than under the popup, and may not appear until well after
+    /// AXPress returns, so poll app-wide for up to ~2s.
+    private func waitForMenuItem(
+        titleContaining option: String,
+        in popup: AXUIElement,
+        appElement: AXUIElement,
+        pid: pid_t
+    ) -> MenuItemMatch? {
+        let deadline = Date().addingTimeInterval(2.0)
+
+        while Date() < deadline {
+            if let match = firstMenuItem(in: popup, appElement: appElement, titleContaining: option) {
+                return match
+            }
+
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        return nil
+    }
+
+    private func firstMenuItem(in popup: AXUIElement, appElement: AXUIElement, titleContaining option: String) -> MenuItemMatch? {
+        // Prefer the popup subtree, then fall back to the app-wide menu windows
+        // (native <select> menus hang off the app, not the popup).
+        for root in [popup] + menuRoots(appElement: appElement) {
+            if let match = firstMenuItemDescending(root, titleContaining: option, depth: 0) {
+                return match
+            }
+        }
+
+        return nil
+    }
+
+    private func firstMenuItemDescending(_ root: AXUIElement, titleContaining option: String, depth: Int) -> MenuItemMatch? {
+        guard depth < 8 else {
+            return nil
+        }
+
+        for candidate in menuCandidates(of: root) {
+            let role = stringValue(of: candidate, attribute: kAXRoleAttribute)
+            let candidateValue = MenuOptionCandidate(
+                role: role,
+                title: menuItemTitle(of: candidate),
+                value: stringValue(of: candidate, attribute: kAXValueAttribute as String)
+            )
+
+            if let title = candidateValue.title ?? candidateValue.value,
+               menuOptionCandidateMatches(candidateValue, option: option)
+            {
+                return MenuItemMatch(element: candidate, title: title)
+            }
+
+            if let match = firstMenuItemDescending(candidate, titleContaining: option, depth: depth + 1) {
+                return match
+            }
+        }
+
+        return nil
+    }
+
+    private func menuItemTitles(in popup: AXUIElement, appElement: AXUIElement) -> [String] {
+        var titles: [String] = []
+        for root in [popup] + menuRoots(appElement: appElement) {
+            titles.append(contentsOf: menuItemTitlesDescending(root, depth: 0))
+        }
+        return titles
+    }
+
+    private func menuItemTitlesDescending(_ root: AXUIElement, depth: Int) -> [String] {
+        guard depth < 8 else {
+            return []
+        }
+
+        var titles: [String] = []
+        for candidate in menuCandidates(of: root) {
+            let role = stringValue(of: candidate, attribute: kAXRoleAttribute)
+            guard isSelectableMenuOptionRole(role) else {
+                continue
+            }
+
+            if let title = menuItemTitle(of: candidate) {
+                titles.append(title)
+            }
+
+            titles.append(contentsOf: menuItemTitlesDescending(candidate, depth: depth + 1))
+        }
+
+        return titles
+    }
+
+    private func menuItemTitle(of element: AXUIElement) -> String? {
+        for attribute in [kAXTitleAttribute as String, kAXValueAttribute as String, kAXDescriptionAttribute as String] {
+            if let value = stringValue(of: element, attribute: attribute), !value.isEmpty {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    /// Menu children hang off a popup via AXChildren, AXChildrenInNavigationOrder
+    /// or a transient AXMenu window, so probe the common attributes. The app's
+    /// own AXMenu windows are included so native selects are discoverable even
+    /// when they are not descended from the popup.
+    private func menuCandidates(of element: AXUIElement) -> [AXUIElement] {
+        var candidates: [AXUIElement] = []
+
+        for attribute in [kAXChildrenAttribute as String, "AXChildrenInNavigationOrder", "AXVisibleChildren", kAXContentsAttribute as String] {
+            if let children = copyArray(element, attribute: attribute) {
+                candidates.append(contentsOf: children)
+            }
+        }
+
+        return candidates
+    }
+
+    /// App-owned menu windows. Native <select> popups are not descendants of the
+    /// trigger element, so they must be located from the application root.
+    private func menuRoots(appElement: AXUIElement) -> [AXUIElement] {
+        var roots: [AXUIElement] = []
+
+        if let focusedWindow = copyElement(appElement, attribute: kAXFocusedWindowAttribute) {
+            roots.append(focusedWindow)
+        }
+
+        for window in copyArray(appElement, attribute: kAXWindowsAttribute) ?? [] {
+            roots.append(window)
+        }
+
+        return roots
+    }
+
+    /// Best-effort dismissal: if the clicked element is a menu item, or the
+    /// popup still exposes menu children, post Escape and confirm removal.
+    @discardableResult
+    private func dismissMenu(pid: pid_t) -> MenuDismissal {
+        try? InputSimulation.pressKey("Escape", pid: pid)
+
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline {
+            let systemWide = AXUIElementCreateSystemWide()
+            if !hasOpenMenu(pid: pid, systemWide: systemWide) {
+                return MenuDismissal(dismissed: true, message: "menu dismissed")
+            }
+
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        return MenuDismissal(dismissed: false, message: "menu still visible after Escape on pid \(pid)")
+    }
+
+    private func hasOpenMenu(pid: pid_t, systemWide: AXUIElement) -> Bool {
+        guard let focusedElement = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute)
+            ?? copyElement(AXUIElementCreateApplication(pid), attribute: kAXFocusedUIElementAttribute)
+        else {
+            return false
+        }
+
+        var current: AXUIElement? = focusedElement
+        for _ in 0..<8 {
+            guard let element = current else {
+                break
+            }
+
+            let role = stringValue(of: element, attribute: kAXRoleAttribute)
+            if role == kAXMenuRole as String || role == kAXMenuItemRole as String {
+                return true
+            }
+
+            current = copyParent(of: element)
+        }
+
+        return false
+    }
+
+    /// After any click that landed on an AXMenuItem, post Escape so the menu
+    /// does not stay open (the manual-click path parallel to select_option).
+    private func dismissMenuAfterMenuClick(snapshot: AppSnapshot, record: ElementRecord?) {
+        guard snapshot.mode == .accessibility else {
+            return
+        }
+
+        let landedOnMenuItem = record?.role == kAXMenuItemRole as String
+        guard landedOnMenuItem || hasOpenMenu(pid: snapshot.app.pid, systemWide: AXUIElementCreateSystemWide()) else {
+            return
+        }
+
+        dismissMenu(pid: snapshot.app.pid)
+    }
+
+    struct FillFormItem {
+        let index: Int
+        let value: String
+    }
+
+    /// Batch-fills N fields from a single validated snapshot with no
+    /// intermediate refreshes, then refreshes once at the end. Continue-on-error
+    /// so the model gets a per-item report instead of failing the whole batch.
+    public func fillForm(
+        app query: String,
+        items: [[String: Any]],
+        snapshotID: String? = nil
+    ) throws -> ToolCallResult {
+        try requireSnapshotID(snapshotID)
+        guard items.count <= 30 else {
+            throw ComputerUseError.invalidArguments("fill_form supports at most 30 items (got \(items.count))")
+        }
+
+        let parsedItems = try items.map(parseFillFormItem(_:))
+        let snapshot = try currentSnapshot(for: query, allowLaunch: false)
+        try validateSnapshotID(snapshotID, snapshot: snapshot)
+
+        var results: [[String: Any]] = []
+        for item in parsedItems {
+            results.append(fillFormItem(item, query: query, snapshot: snapshot))
+        }
+
+        let refreshed = try refreshSnapshot(for: query, allowLaunch: false)
+        let payload: [String: Any] = [
+            "results": results,
+            "snapshot_id": refreshed.snapshotID,
+        ]
+        let json = (try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes]))
+            .flatMap { String(data: $0, encoding: .utf8) }
+            ?? "{\"results\":[]}"
+
+        return ToolCallResult.text("filled \(results.filter { $0["ok"] as? Bool == true }.count)/\(results.count) fields\n\(json)")
+    }
+
+    func parseFillFormItem(_ raw: [String: Any]) throws -> FillFormItem {
+        guard let index = optionalIntValue(raw["index"]) else {
+            throw ComputerUseError.invalidArguments("fill_form item requires an integer 'index'")
+        }
+
+        guard let value = raw["value"] as? String else {
+            throw ComputerUseError.invalidArguments("fill_form item \(index) requires a string 'value'")
+        }
+
+        return FillFormItem(index: index, value: value)
+    }
+
+    func fillFormItem(_ item: FillFormItem, query: String, snapshot: AppSnapshot) -> [String: Any] {
+        func failure(_ message: String) -> [String: Any] {
+            ["index": item.index, "ok": false, "error": message]
+        }
+
+        guard let record = snapshot.elements[item.index] else {
+            return failure("unknown element_index '\(item.index)'")
+        }
+
+        if snapshot.mode == .fixture {
+            guard let identifier = record.identifier else {
+                return failure("fixture set_value requires a known element identifier")
+            }
+
+            do {
+                try FixtureBridge.post(FixtureCommand(kind: "set_value", identifier: identifier, value: item.value))
+                return ["index": item.index, "ok": true]
+            } catch {
+                return failure((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+            }
+        }
+
+        guard let element = record.element else {
+            return failure("element \(item.index) has no backing accessibility object")
+        }
+
+        guard axElementIsValid(element) else {
+            return failure(staleElementErrorMessage)
+        }
+
+        guard (try? isSettableForSetValue(element: element, attribute: kAXValueAttribute)) == true else {
+            return failure(nonSettableSetValueErrorMessage(record: record, snapshot: snapshot))
+        }
+
+        guard pid(of: element) == snapshot.app.pid else {
+            return failure(staleSnapshotErrorMessage)
+        }
+
+        let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, item.value as CFString)
+        switch result {
+        case .success:
+            return ["index": item.index, "ok": true]
+        case .invalidUIElement:
+            return failure(staleElementErrorMessage)
+        default:
+            return failure("AXUIElementSetAttributeValue failed with \(result.rawValue)")
+        }
+    }
+
+    private func optionalIntValue(_ value: Any?) -> Int? {
+        if let integer = value as? Int {
+            return integer
+        }
+
+        if let double = value as? Double, double.rounded(.towardZero) == double,
+           double >= Double(Int.min), double <= Double(Int.max)
+        {
+            return Int(double)
+        }
+
+        return nil
     }
 
     public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
@@ -759,17 +1498,25 @@ public final class ComputerUseService {
         )
     }
 
-    public func typeText(app query: String, text: String) throws -> ToolCallResult {
-        let snapshot = try currentSnapshot(for: query)
+    public func typeText(app query: String, text: String, snapshotID: String? = nil) throws -> ToolCallResult {
+        try performWithStaleRetry(query: query, snapshotID: snapshotID) { effectiveID in
+            try performTypeText(app: query, text: text, snapshotID: effectiveID)
+        }
+    }
+
+    private func performTypeText(app query: String, text: String, snapshotID: String? = nil) throws -> ToolCallResult {
+        try requireSnapshotID(snapshotID)
+        let snapshot = try currentSnapshot(for: query, allowLaunch: false)
+        try validateSnapshotID(snapshotID, snapshot: snapshot)
         if snapshot.mode == .fixture {
             try FixtureBridge.post(FixtureCommand(kind: "type_text", identifier: "fixture-input", value: text))
             Thread.sleep(forTimeInterval: 0.15)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return snapshotResult(for: try refreshSnapshot(for: query, allowLaunch: false), style: .actionResult)
         }
 
         if try typeTextBySettingFocusedValueIfAvailable(text, in: snapshot) {
             Thread.sleep(forTimeInterval: 0.1)
-            return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+            return snapshotResult(for: try refreshSnapshot(for: query, allowLaunch: false), style: .actionResult)
         }
 
         guard try canTypeTextUsingKeyboardFallback(in: snapshot) else {
@@ -777,7 +1524,7 @@ public final class ComputerUseService {
         }
 
         try InputSimulation.typeText(text, pid: snapshot.app.pid)
-        return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
+        return snapshotResult(for: try refreshSnapshot(for: query, allowLaunch: false), style: .actionResult)
     }
 
     public func pressKey(app query: String, key: String) throws -> ToolCallResult {
@@ -792,9 +1539,18 @@ public final class ComputerUseService {
         return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
-    public func setValue(app query: String, elementIndex: String, value: String) throws -> ToolCallResult {
-        let snapshot = try currentSnapshot(for: query)
-        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+    public func setValue(app query: String, elementIndex: String?, value: String, snapshotID: String? = nil, elementKey: String? = nil) throws -> ToolCallResult {
+        try performWithStaleRetry(query: query, snapshotID: snapshotID) { effectiveID in
+            try performSetValue(app: query, elementIndex: elementIndex, value: value, snapshotID: effectiveID, elementKey: elementKey)
+        }
+    }
+
+    private func performSetValue(app query: String, elementIndex: String?, value: String, snapshotID: String? = nil, elementKey: String? = nil) throws -> ToolCallResult {
+        try requireSnapshotID(snapshotID)
+        let snapshot = try currentSnapshot(for: query, allowLaunch: false)
+        try validateSnapshotID(snapshotID, snapshot: snapshot)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex, elementKey: elementKey)
+        let targetDescription = record.identifier.map { "element_key=\($0)" } ?? "element_index=\(elementIndex ?? "")"
 
         if snapshot.mode == .fixture {
             guard let identifier = record.identifier else {
@@ -810,19 +1566,30 @@ public final class ComputerUseService {
         }
 
         guard let element = record.element else {
-            throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
+            throw ComputerUseError.stateUnavailable("element \(targetDescription) has no backing accessibility object")
+        }
+
+        guard axElementIsValid(element) else {
+            throw ComputerUseError.staleElement(staleElementErrorMessage)
         }
 
         guard try isSettableForSetValue(element: element, attribute: kAXValueAttribute) else {
-            throw ComputerUseError.message(nonSettableSetValueErrorMessage)
+            throw ComputerUseError.message(nonSettableSetValueErrorMessage(record: record, snapshot: snapshot))
         }
 
         let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
         moveVisualCursor(to: cursorTarget)
 
         do {
+            try revalidateTargetWindow(for: snapshot, record: record, element: element)
+
             let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
-            guard result == .success else {
+            switch result {
+            case .success:
+                break
+            case .invalidUIElement:
+                throw ComputerUseError.staleElement(staleElementErrorMessage)
+            default:
                 throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
             }
 
@@ -836,12 +1603,73 @@ public final class ComputerUseService {
         return snapshotResult(for: try refreshSnapshot(for: query), style: .actionResult)
     }
 
-    private func currentSnapshot(for query: String) throws -> AppSnapshot {
+    private func validateSnapshotID(_ provided: String?, snapshot: AppSnapshot) throws {
+        try validateSnapshotIDValue(provided, snapshot: snapshot)
+    }
+
+    private func revalidateClickWindow(snapshot: AppSnapshot) throws {
+        let currentTitle = currentWindowTitle(for: snapshot)
+        if let expectedTitle = snapshot.windowTitle,
+           let currentTitle,
+           currentTitle != expectedTitle
+        {
+            throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+        }
+    }
+
+    /// Live liveness + ownership probe before any click is performed. A stale
+    /// element handle or an element that belongs to a different app than the
+    /// snapshot is rejected so we never blind-fire at the wrong window/app.
+    private func validateClickElement(record: ElementRecord, snapshot: AppSnapshot) throws {
+        guard let element = record.element else {
+            return
+        }
+
+        guard axElementIsValid(element) else {
+            throw ComputerUseError.staleElement(staleElementErrorMessage)
+        }
+
+        try validateClickOwnership(elementPID: pid(of: element), snapshotPID: snapshot.app.pid)
+    }
+
+    private func revalidateTargetWindow(for snapshot: AppSnapshot, record: ElementRecord, element: AXUIElement) throws {
+        guard axElementIsValid(element) else {
+            throw ComputerUseError.staleElement(staleElementErrorMessage)
+        }
+
+        guard pid(of: element) == snapshot.app.pid else {
+            throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+        }
+
+        let currentTitle = currentWindowTitle(for: snapshot)
+        if let expectedTitle = snapshot.windowTitle,
+           let currentTitle,
+           currentTitle != expectedTitle
+        {
+            throw ComputerUseError.staleSnapshot(staleSnapshotErrorMessage)
+        }
+    }
+
+    private func currentWindowTitle(for snapshot: AppSnapshot) -> String? {
+        let appElement = AXUIElementCreateApplication(snapshot.app.pid)
+        let focusedApplication = copyElement(AXUIElementCreateSystemWide(), attribute: kAXFocusedApplicationAttribute)
+        guard let window = SnapshotBuilder.currentWindow(
+            appElement: appElement,
+            appPID: snapshot.app.pid,
+            focusedApplication: focusedApplication
+        ) else {
+            return nil
+        }
+
+        return stringValue(of: window, attribute: kAXTitleAttribute)
+    }
+
+    private func currentSnapshot(for query: String, allowLaunch: Bool = true) throws -> AppSnapshot {
         if let snapshot = snapshotsByApp[query.lowercased()] {
             return snapshot
         }
 
-        return try refreshSnapshot(for: query)
+        return try refreshSnapshot(for: query, allowLaunch: allowLaunch)
     }
 
     @discardableResult
@@ -851,9 +1679,11 @@ public final class ComputerUseService {
         treeLimits: AccessibilityTreeLimits = .defaults,
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
         screenshotMaxDimension: CGFloat = screenshotResultMaxDimension,
-        screenshotRegion: CaptureRegion? = nil
+        screenshotRegion: CaptureRegion? = nil,
+        allowLaunch: Bool = true
     ) throws -> AppSnapshot {
-        let app = try AppDiscovery.resolve(query)
+        // Click/type/set_value must never launch the app; only get_app_state may.
+        let app = allowLaunch ? try AppDiscovery.resolve(query) : try AppDiscovery.resolveRunningOnly(query)
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
@@ -869,11 +1699,14 @@ public final class ComputerUseService {
             (app.bundleIdentifier ?? "").lowercased(),
         ].filter { !$0.isEmpty })
 
+        let previous = keys.compactMap { snapshotsByApp[$0] }.first { $0.mode == snapshot.mode }
+        let stableSnapshot = snapshot.preservingSnapshotID(from: previous)
+
         for key in keys {
-            snapshotsByApp[key] = snapshot
+            snapshotsByApp[key] = stableSnapshot
         }
 
-        return snapshot
+        return stableSnapshot
     }
 
     private func lookupElement(snapshot: AppSnapshot, index: String) throws -> ElementRecord {
@@ -882,6 +1715,28 @@ public final class ComputerUseService {
         }
 
         return record
+    }
+
+    /// Resolve by AX identifier first (stable across reorder), falling back to
+    /// the numeric index. `element_key` is the cheaper, churn-resistant handle.
+    func lookupElement(snapshot: AppSnapshot, index: String?, elementKey: String?) throws -> ElementRecord {
+        if let elementKey, !elementKey.isEmpty {
+            if let record = snapshot.elements.values.first(where: { $0.identifier == elementKey }) {
+                return record
+            }
+
+            guard let index else {
+                throw ComputerUseError.invalidArguments("unknown element_key '\(elementKey)'")
+            }
+
+            return try lookupElement(snapshot: snapshot, index: index)
+        }
+
+        guard let index else {
+            throw ComputerUseError.missingArgument("element_index")
+        }
+
+        return try lookupElement(snapshot: snapshot, index: index)
     }
 
     func matchingAction(requested: String, record: ElementRecord) -> String? {

@@ -141,6 +141,27 @@ enum AppDiscovery {
             }
     }
 
+    /// Resolves an already-running app without ever launching it. Used by
+    /// `focus_window` so that focusing a missing app fails instead of opening it.
+    static func resolveRunningOnly(_ query: String, pid explicitPID: pid_t? = nil) throws -> RunningAppDescriptor {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let running = runningApps()
+
+        if let bundleIdentifier = blockedBundleIdentifier(forQuery: normalizedQuery) {
+            throw AppSafetyPolicy.permissionDenied(bundleIdentifier: bundleIdentifier)
+        }
+
+        if let explicitPID, let match = running.first(where: { $0.pid == explicitPID }) {
+            return match
+        }
+
+        if let match = resolvedRunningApp(in: running, matching: normalizedQuery) {
+            return match
+        }
+
+        throw ComputerUseError.appNotFound(normalizedQuery)
+    }
+
     static func resolve(_ query: String) throws -> RunningAppDescriptor {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let running = runningApps()
